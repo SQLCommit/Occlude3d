@@ -1,7 +1,6 @@
-# occlude3d - Depth-Correct World Geometry for Ashita v4.3
+# Occlude3d - Depth Correct World Geometry Plugin for Ashita v4.3
 
 [![Latest release](https://img.shields.io/github/v/release/SQLCommit/Occlude3d?sort=semver)](../../releases/latest)
-[![Downloads](https://img.shields.io/github/downloads/SQLCommit/Occlude3d/total)](../../releases)
 [![License](https://img.shields.io/badge/license-LGPL--3.0_%2F_MIT-blue)](#license)
 ![Ashita](https://img.shields.io/badge/Ashita-4.3.1.2_(iface_4.30)-blueviolet)
 
