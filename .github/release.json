@@ -1,0 +1,21 @@
+{
+  "name": "Occlude3d",
+  "repository": "SQLCommit/Occlude3d",
+  "dll": "occlude3d.dll",
+  "buildOutput": "build/Release/occlude3d.dll",
+  "docsFolder": "occlude3d",
+  "docs": [
+    "README.md",
+    "API.md",
+    "LICENSE",
+    "GPL-3.0.txt",
+    "THIRD_PARTY_NOTICES.md"
+  ],
+  "extras": [
+    "addons/magiccircle"
+  ],
+  "versionFile": "src/occlude3d.cpp",
+  "versionPattern": "#define\\s+OCCLUDE3D_VERSION\\s+([0-9]+\\.[0-9]+)",
+  "ashitaSdkRef": "4171c74c8ddb2ca2a31654f199e6c1cee40d7256",
+  "ashitaInterface": "4.30"
+}
