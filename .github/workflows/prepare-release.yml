@@ -1,14 +1,12 @@
-# Prepare release. Starts by itself when you save a DRAFT release on GitHub whose tag is the version the plugin
-# reports (for example v1.3); it can also be run by hand (Actions > Prepare release > Run workflow). It builds that
-# version against the Ashita SDK pinned in .github/release.json, runs the tests, and attaches the zip and SHA-256 sums
-# to the draft with a Downloads section under your notes, plus a build attestation. Check the draft, then publish it.
-# A release published without being a draft first is left alone here; Release check reports it.
+# Prepare release. Run it by hand (Actions > Prepare release > Run workflow) after saving a DRAFT release on GitHub
+# whose tag is the version the plugin reports (for example v1.3). (Saving a draft cannot start it: GitHub does not
+# run workflows for draft releases.) It builds that version against the Ashita SDK pinned in .github/release.json,
+# runs the tests, and attaches the zip and SHA-256 sums to the draft with a Downloads section under your notes, plus
+# a build attestation. Check the draft, then publish it yourself.
 name: Prepare release
-run-name: Prepare release ${{ inputs.tag || github.event.release.tag_name }}
+run-name: Prepare release ${{ inputs.tag }}
 
 on:
-  release:
-    types: [created]
   workflow_dispatch:
     inputs:
       tag:
@@ -24,12 +22,10 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  TAG: ${{ inputs.tag || github.event.release.tag_name }}
+  TAG: ${{ inputs.tag }}
 
 jobs:
   build:
-    # By hand, or a saved draft (the rebuild workflow's drafts are built already and carry _Interface in the tag).
-    if: ${{ github.event_name == 'workflow_dispatch' || (github.event.release.draft && !contains(github.event.release.tag_name, '_Interface')) }}
     runs-on: windows-2022
     permissions:
       contents: read
