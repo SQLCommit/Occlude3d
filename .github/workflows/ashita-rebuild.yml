@@ -1,7 +1,7 @@
 # Ashita rebuild. Run it by hand (Actions > Ashita rebuild > Run workflow) when Ashita publishes a new release, and
 # enter the commit ID of that Ashita release. If its plugin interface differs from the latest release of this plugin,
 # it rebuilds that release's source against the new SDK, runs the tests, and saves a DRAFT release tagged
-# vX.Y-ashitaN.NN with the zip, SHA-256 sums and a build attestation. The original release stays as it is.
+# vX.Y_Interface-N.NN with the zip, SHA-256 sums and a build attestation. The original release stays as it is.
 # Test the draft's zip in game, then publish it (as the latest release). If nothing changed it does nothing; if the
 # build or tests fail it opens an issue instead.
 name: Ashita rebuild
@@ -171,9 +171,9 @@ jobs:
             throw "$env:TAG appeared while this run was building; check the releases before running it again."
           }
           $intro = @(
-            "Rebuild of [$env:BASE]($env:RELEASES_URL/$env:BASE) for Ashita plugin interface **$env:INTERFACE**. The plugin's code is unchanged.",
+            "Rebuild of [$env:BASE]($env:RELEASES_URL/$env:BASE) for Interface **$env:INTERFACE**. The plugin's code is unchanged.",
             '',
-            "For Ashita plugin interface $env:FROM, use [$env:PREVIOUS]($env:RELEASES_URL/$env:PREVIOUS)."
+            "For Interface $env:FROM, use [$env:PREVIOUS]($env:RELEASES_URL/$env:PREVIOUS)."
           ) -join "`n"
           $notes = Join-ReleaseNotes -Body $intro -Downloads ((Get-Content (Join-Path $env:FILES 'downloads.md')) -join "`n")
           $notesFile = Join-Path $env:RUNNER_TEMP 'notes.md'

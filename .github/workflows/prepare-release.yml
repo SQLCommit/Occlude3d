@@ -28,8 +28,8 @@ env:
 
 jobs:
   build:
-    # By hand, or a saved draft (the rebuild workflow's drafts are built already and carry -ashita in the tag).
-    if: ${{ github.event_name == 'workflow_dispatch' || (github.event.release.draft && !contains(github.event.release.tag_name, '-ashita')) }}
+    # By hand, or a saved draft (the rebuild workflow's drafts are built already and carry _Interface in the tag).
+    if: ${{ github.event_name == 'workflow_dispatch' || (github.event.release.draft && !contains(github.event.release.tag_name, '_Interface')) }}
     runs-on: windows-2022
     permissions:
       contents: read

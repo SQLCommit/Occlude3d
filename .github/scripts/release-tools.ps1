@@ -102,7 +102,7 @@ function Get-BuildInfo {
     }
 }
 
-# In $OutDir: <Name>-v<Version>-ashita<Interface>.zip (plugins\<dll>, docs\<folder>\... with BUILDINFO.json, and any
+# In $OutDir: <Name>-v<Version>_Interface-<Interface>.zip (plugins\<dll>, docs\<folder>\... with BUILDINFO.json, and any
 # extras at their own paths, so it extracts straight into the Ashita folder) and SHA256SUMS.txt. Every listed document
 # is required. Returns the zip's file name.
 function New-ReleasePackage {
@@ -110,7 +110,7 @@ function New-ReleasePackage {
     New-Item -ItemType Directory -Force $OutDir | Out-Null
     $rootPath = (Resolve-Path $Root).Path
     $outPath = (Resolve-Path $OutDir).Path
-    $zipName = "$($Cfg.name)-v$Version-ashita$Interface.zip"
+    $zipName = "$($Cfg.name)-v${Version}_Interface-$Interface.zip"
     $zipPath = Join-Path $outPath $zipName
     $entries = New-Object System.Collections.Generic.List[object]
     $entries.Add(@($Dll, "plugins/$($Cfg.dll)"))
@@ -156,7 +156,7 @@ function Get-DownloadNotes {
         $script:NotesMarker,
         '### Downloads',
         '',
-        "**$ZipName** - for Ashita plugin interface **$Interface**. Extract it into your Ashita folder: it adds ``plugins\$($Cfg.dll)`` and ``docs\$($Cfg.docsFolder)\``.",
+        "**$ZipName** - for Interface **$Interface** (Ashita's plugin interface). Extract it into your Ashita folder: it adds ``plugins\$($Cfg.dll)`` and ``docs\$($Cfg.docsFolder)\``.",
         '',
         "Built by GitHub Actions from this release's source with the Ashita SDK at AshitaXI/Ashita-v4beta@$SdkRef (details in ``docs\$($Cfg.docsFolder)\BUILDINFO.json``).",
         '',
@@ -187,15 +187,15 @@ function Get-RebuildPlan {
     $latest = Invoke-Gh @('api', "repos/$Repo/releases/latest", '--jq', '.tag_name') -AllowNotFound
     if (-not $latest) { return & $skip 'this repository has no published release yet.' }
     $latest = $latest.Trim()
-    $base = $latest -replace '-ashita[0-9.]+$', ''
-    if ($latest -match '-ashita([0-9.]+)$') { $current = $Matches[1] }
+    $base = $latest -replace '_Interface-[0-9.]+$', ''
+    if ($latest -match '_Interface-([0-9.]+)$') { $current = $Matches[1] }
     else {
         $json = Invoke-Gh @('api', '-H', $script:RawFile, "repos/$Repo/contents/.github/release.json?ref=$base") -AllowNotFound
         if (-not $json) { return & $skip "release $base was published before the release workflows were added; make a new release first." }
         $current = ($json | ConvertFrom-Json).ashitaInterface
     }
     if ($interface -eq $current) { return & $skip "Ashita commit $($AshitaCommit.Substring(0, 7)) is still interface $current, the same as $latest." }
-    $tag = "$base-ashita$interface"
+    $tag = "${base}_Interface-$interface"
     if (Invoke-Gh @('release', 'view', $tag, '--repo', $Repo, '--json', 'tagName') -AllowNotFound) {
         return & $skip "$tag already exists (published or draft)."
     }
