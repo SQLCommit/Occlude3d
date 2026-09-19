@@ -124,7 +124,7 @@ at once without losing a line.
 
 ## Version history
 
-See **CHANGELOG.md**.
+See [CHANGELOG.md](CHANGELOG.md).
 
 ## Thanks
 
