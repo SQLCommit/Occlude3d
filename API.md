@@ -1,10 +1,10 @@
-# Occlude3d - API Reference
+# occlude3d - API Reference
 
-> **Wire format:** `O3D2` (v1) submission + `O3DF` (v1) font registry. **This doc matches occlude3d v1.0.**
+> **Wire format:** `O3D2` (v1) submission + `O3DF` (v1) font registry. **This doc matches occlude3d v1.1** (the wire format is unchanged since v1.0).
 > Everything is **little-endian** and **packed (no padding)**. occlude3d's format is first-party (not
 > reverse-engineered); the C structs below mirror the plugin's own decode.
 
-Occlude3d is a **shared rendering library**: any Ashita addon submits world-space geometry, and the
+occlude3d is a **shared rendering library**: any Ashita addon submits world-space geometry, and the
 plugin draws it **depth-occluded** against the game's world depth buffer (hidden by terrain/walls like
 native world objects) by hooking the engine's nameplate-draw routine. Your addon sends raw bytes; the
 plugin owns all the rendering.
@@ -13,8 +13,8 @@ plugin owns all the rendering.
 
 ## 1. Requirements
 
-- **Ashita 4.3.1.2 (interface version 4.30)** - the version occlude3d and the example addon were built
-  and tested against. Load the plugin with `/load occlude3d`.
+- **Ashita 4.3.1.2 or later** with plugin interface **4.30** - occlude3d is built against 4.3.1.2's SDK and
+  tested on 4.3.2.1. Load the plugin with `/load occlude3d`.
 - Your addon: `require('struct')` (to pack the buffer) and, for textures, `require('d3d8')` + `ffi`.
 - occlude3d ships no SDK/headers - the entire interface is the byte buffer documented here.
 
@@ -77,7 +77,7 @@ end
 
 ```lua
 local ffi = require('ffi');
-local CAP = 16384;                                    -- occlude3d's per-owner cap (section 11)
+local CAP = 16384;                                    -- occlude3d's per-owner cap
 local buf = ffi.new('uint8_t[?]', CAP);
 local ptr = tonumber(ffi.cast('uintptr_t', buf));
 local mgr = AshitaCore:GetPluginManager();

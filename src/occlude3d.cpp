@@ -6,6 +6,7 @@
  * there, so it occludes correctly.
  */
 #include "occlude3d.hpp"
+#include "unload.hpp"
 
 #include <cstdio>
 #include <cstring>
@@ -13,8 +14,9 @@
 #include <cfloat>
 #include <string>
 #include <vector>
+#include <cstdarg>
 
-#define OCCLUDE3D_VERSION  1.0
+#define OCCLUDE3D_VERSION  1.1
 
 #define OCCLUDE3D_SENTINEL "occlude3d"
 
@@ -28,18 +30,31 @@
 namespace
 {
     volatile uint32_t g_hookCalls   = 0;
-    void*             g_trampoline  = nullptr;
+    volatile long     g_inFlight    = 0;         // hook calls inside RenderHookDraw right now (they call into Direct3D, outside this DLL)
+    void*             g_trampoline  = nullptr;   // once published, never freed: a thread may still be in it (process lifetime)
     uintptr_t         g_hookAddr    = 0;
     uint8_t           g_origBytes[5] = { 0 };
-    bool              g_installed   = false;
+    bool              g_installed   = false;     // our JMP is (or may still be) at the entry
+    bool              g_retained    = false;     // an unload could not take the hook out: the next load is refused
+    bool              g_keepInstance = false;    // a hook call never drained: the instance and its resources are leaked, never freed
+    bool              g_pinned      = false;     // this DLL stays mapped until the game closes (pinned before the first write)
     occlude3d*        g_instance    = nullptr;
+    plog::FileLog     g_log;                     // logs\occlude3d\<Name>_<id>\occlude3d.log; nothing goes to Ashita's log
+    const char*       levelName(uint32_t level)
+    {
+        return level == static_cast<uint32_t>(Ashita::LogLevel::Error) ? "error" : level == static_cast<uint32_t>(Ashita::LogLevel::Warn) ? "warn" : "info";
+    }
 }
 
+// The stub stays pass-through-safe after unload: the instance may be gone (null) and the trampoline is never freed.
 static void do_hook_work(void)
 {
     g_hookCalls++;
-    if (g_instance != nullptr)
-        g_instance->RenderHookDraw();
+    InterlockedIncrement(&g_inFlight);   // counted before the instance is read, so unload sees every caller that has one
+    occlude3d* inst = g_instance;
+    if (inst != nullptr)
+        inst->RenderHookDraw();
+    InterlockedDecrement(&g_inFlight);
 }
 
 namespace
@@ -68,7 +83,7 @@ occlude3d::occlude3d(void)
     , m_Hooked(false)
     , m_TriedAutoHook(false)
     , m_WarnedUnhooked(false)
-    , m_Stats(false)
+    , m_Legacy(false)
     , m_QpcFreq(0)
     , m_StatFrames(0)
     , m_HookMs(0.0)
@@ -80,6 +95,8 @@ occlude3d::occlude3d(void)
     , m_FrameItems(0)
     , m_FrameOwners(0)
     , m_FrameState(0)
+    , m_FrameDraws(0)
+    , m_DrawsAcc(0.0)
     , m_DropOversize(0)
     , m_DropNoSlot(0)
     , m_DropBadItem(0)
@@ -90,12 +107,12 @@ occlude3d::occlude3d(void)
     , m_DispItems(0.0)
     , m_DispOwners(0.0)
     , m_DispState(0.0)
+    , m_DispDraws(0.0)
     , m_DispDrawMs(0.0)
     , m_DispRecvMs(0.0)
     , m_DispBytes(0.0)
     , m_HistPos(0)
 {
-    memset(this->m_DropWarnTick, 0, sizeof(this->m_DropWarnTick));
     memset(this->m_Owners, 0, sizeof(this->m_Owners));
     memset(this->m_Fonts,  0, sizeof(this->m_Fonts));
     memset(this->m_HistDrawMs, 0, sizeof(this->m_HistDrawMs));
@@ -123,7 +140,7 @@ const char* occlude3d::GetDescription(void) const
 
 const char* occlude3d::GetLink(void) const
 {
-    return "https://github.com/SQLCommit";
+    return "https://github.com/SQLCommit/Occlude3d";
 }
 
 double occlude3d::GetVersion(void) const
@@ -153,6 +170,31 @@ bool occlude3d::Initialize(IAshitaCore* core, ILogManager* logger, const uint32_
     this->m_AshitaCore = core;
     this->m_LogManager = logger;
     UNREFERENCED_PARAMETER(id);
+    this->m_Root = plog::ashitaRoot(reinterpret_cast<const void*>(&hook_OnMove));
+    this->m_Run  = plog::thisRun();
+    g_log.open(this->m_Root, plog::startupLogPath(this->m_Root, "occlude3d", this->m_Run));
+    char ver[16], iface[16];
+    _snprintf_s(ver, sizeof ver, _TRUNCATE, "%.1f", OCCLUDE3D_VERSION);
+    _snprintf_s(iface, sizeof iface, _TRUNCATE, "%.2f", ASHITA_INTERFACE_VERSION);
+    const std::string session = plog::sessionText("occlude3d", ver, plog::ownImageStamp(reinterpret_cast<const void*>(&hook_OnMove)),
+                                                  plog::imageStamp(GetModuleHandleA("FFXiMain.dll")), iface, this->m_Run);
+    g_log.setSession(session, this->m_Run);
+    g_log.write("info", session);
+    g_log.start();
+    // A previous load of this (pinned) image could not take its hook out: its stub is still reachable and must keep
+    // its state. A second instance over it is refused; a game restart clears it.
+    if (g_retained)
+    {
+        this->m_Refused = true;
+        this->FollowCharacter();
+        this->LogLine(static_cast<uint32_t>(Ashita::LogLevel::Error), "occlude3d", "load refused: the hook from an earlier load is still in (unload could not restore it)");
+        char line[300];
+        _snprintf_s(line, sizeof line, _TRUNCATE, "an earlier occlude3d could not undo its hook this session; restart the game to load it again. (%s)", this->LogShown().c_str());
+        this->WriteChat(line, 0x6A);   // 0x6A: the log path is already in the text, without the "moves" note
+        g_log.stop();
+        return false;
+    }
+    g_instance = nullptr;
 
     if (core != nullptr && core->GetPointerManager() != nullptr)
     {
@@ -160,14 +202,34 @@ bool occlude3d::Initialize(IAshitaCore* core, ILogManager* logger, const uint32_
             OCCLUDE3D_SENTINEL,
             static_cast<uintptr_t>(OCCLUDE3D_VERSION * 100.0 + 0.5));
     }
-
-
+    const std::string root = this->m_Root;
+    const plog::Run run = this->m_Run;
+    g_log.post([root, run]
+    {
+        plog::deleteFiles(root, { "logs\\occlude3d\\occlude3d.log", "logs\\occlude3d\\occlude3d.log.old" });
+        plog::cleanupStartupFiles(root, "occlude3d", run);
+    });
+    this->FollowCharacter();
     return true;
 }
 
 void occlude3d::Release(void)
 {
+    if (this->m_Refused) { g_log.stop(); return; }
+    if (this->m_Shot != 0) this->FinishShot();   // a report still waiting is written with what there is
+    for (const auto& r : this->m_Repeats.take())
+        g_log.write("warn", r.first + ": " + std::to_string(r.second) + " times this session");
     this->RemoveHook();
+
+    if (g_keepInstance && g_instance == this)   // the same condition expDestroyPlugin uses to skip the delete
+    {
+        // A hook call may still be drawing with these: they stay alive with the instance.
+        g_log.write("warn", "unloaded with a hook call still in flight: instance, textures and fonts are kept, not freed" + plog::runSuffix(this->m_Run));
+        if (this->m_AshitaCore != nullptr && this->m_AshitaCore->GetPointerManager() != nullptr)
+            this->m_AshitaCore->GetPointerManager()->Delete(OCCLUDE3D_SENTINEL);
+        g_log.stop();
+        return;
+    }
 
     for (int i = 0; i < kMaxOwners; ++i)
     {
@@ -191,16 +253,12 @@ void occlude3d::Release(void)
         this->m_AshitaCore->GetPointerManager()->Delete(OCCLUDE3D_SENTINEL);
     }
 
-    if (this->m_LogManager != nullptr)
-    {
-        this->m_LogManager->Log(
-            static_cast<uint32_t>(Ashita::LogLevel::Info),
-            "occlude3d",
-            "Unloaded.");
-    }
+    g_log.write("info", std::string(g_retained ? "unloaded; the hook stays in (pass-through) until the game closes" : "unloaded") + plog::runSuffix(this->m_Run));
+    // The log writer may be stuck on a stalled share: it gets 2 s, then finishes by itself with the DLL kept mapped.
+    if (!g_log.stop() && !g_pinned) g_pinned = occ::pinSelf(reinterpret_cast<const void*>(&hook_OnMove));
 }
 
-bool occlude3d::HandleCommand(int32_t mode, const char* command, bool injected)
+bool occlude3d::Command(int32_t mode, const char* command, bool injected)
 {
     UNREFERENCED_PARAMETER(mode);
     UNREFERENCED_PARAMETER(injected);
@@ -214,6 +272,7 @@ bool occlude3d::HandleCommand(int32_t mode, const char* command, bool injected)
 
     if (_stricmp(args[0].c_str(), "/occlude3d") != 0 && _stricmp(args[0].c_str(), "/o3d") != 0)
         return false;
+    this->m_CmdOurs = true;
 
     const char* sub = (args.size() > 1) ? args[1].c_str() : "";
 
@@ -231,7 +290,18 @@ bool occlude3d::HandleCommand(int32_t mode, const char* command, bool injected)
     }
     else if (_stricmp(sub, "stats") == 0)
     {
-        this->m_Stats = !this->m_Stats;
+        this->StartShot(1);
+    }
+    else if (_stricmp(sub, "diag") == 0)
+    {
+        this->StartShot(2);
+    }
+    else if (_stricmp(sub, "legacy") == 0)
+    {
+        const char* v = (args.size() > 2) ? args[2].c_str() : "";
+        if (_stricmp(v, "on") == 0)       this->m_Legacy = true;
+        else if (_stricmp(v, "off") == 0) this->m_Legacy = false;
+        else                              this->m_Legacy = !this->m_Legacy;
         this->ResetStatAccumulators();
     }
     else if (_stricmp(sub, "ui") == 0 || sub[0] == '\0')
@@ -241,40 +311,49 @@ bool occlude3d::HandleCommand(int32_t mode, const char* command, bool injected)
 
     {
         char body[160];
-        _snprintf_s(body, sizeof(body), _TRUNCATE, "hook=%s, stats=%s (panel: /o3d).",
-            this->m_Hooked ? "ON" : "off", this->m_Stats ? "ON" : "off");
+        _snprintf_s(body, sizeof(body), _TRUNCATE, "hook=%s, legacy=%s (panel: /o3d).",
+            this->m_Hooked ? "ON" : "off", this->m_Legacy ? "ON" : "off");
         this->WriteChat(body);
     }
 
     return true;
 }
 
+bool occlude3d::HandleCommand(int32_t mode, const char* command, bool injected)
+{
+    this->m_CmdOurs = false;
+    try
+    {
+        return this->Command(mode, command, injected);
+    }
+    catch (...)
+    {
+        if (!this->m_CmdOurs) return false;   // it failed before it was known to be ours: leave it to its owner
+        g_log.write("error", "HandleCommand: an unexpected error");
+        this->WriteChat("the command failed with an unexpected error.", 0x44);
+        return true;
+    }
+}
+
 bool occlude3d::Direct3DInitialize(IDirect3DDevice8* device)
 {
     this->m_Device = device;
 
-    if (this->m_LogManager != nullptr)
-    {
-        this->m_LogManager->Logf(
-            static_cast<uint32_t>(Ashita::LogLevel::Info),
-            "occlude3d",
-            "Direct3DInitialize ok (device=0x%p).", static_cast<void*>(device));
-    }
+    this->LogF(static_cast<uint32_t>(Ashita::LogLevel::Info), "occlude3d", "Direct3DInitialize ok (device=0x%p).", static_cast<void*>(device));
 
     return true;
 }
 
 uintptr_t occlude3d::ResolveNameDraw(void)
 {
-    if (this->m_LogManager == nullptr)
-        return 0;
+    this->m_HookDetail.clear();
     const uint32_t LL = static_cast<uint32_t>(Ashita::LogLevel::Info);
 
     HMODULE h = GetModuleHandleA("FFXiMain.dll");
     if (h == nullptr) h = GetModuleHandleA("ffximain.dll");
     if (h == nullptr)
     {
-        this->m_LogManager->Log(LL, "occlude3d", "HOOK: FFXiMain.dll module handle not found.");
+        this->LogLine(LL, "occlude3d", "HOOK: FFXiMain.dll module handle not found.");
         return 0;
     }
 
@@ -283,7 +362,7 @@ uintptr_t occlude3d::ResolveNameDraw(void)
     const uint8_t* base = reinterpret_cast<const uint8_t*>(h);
     const uint32_t size = nt->OptionalHeader.SizeOfImage;
 
-    this->m_LogManager->Logf(LL, "occlude3d", "HOOK: FFXiMain base=0x%08X SizeOfImage=0x%X", reinterpret_cast<uint32_t>(base), size);
+    this->HookDetail("HOOK: FFXiMain base=0x%08X SizeOfImage=0x%X", reinterpret_cast<uint32_t>(base), size);
 
     //   CXiActorNameDraw::OnMove signature (Provided by Atom0s in Discord chat):
     //   A1 ?? ?? ?? ?? 83 38 60 0F ?? ?? ?? ?? ?? 8B 0D ?? ?? ?? ?? 56 6A
@@ -309,12 +388,12 @@ uintptr_t occlude3d::ResolveNameDraw(void)
 
     this->m_NameDrawAddr = firstAddrs[0];
     this->m_HookMatches  = found;
-    this->m_LogManager->Logf(LL, "occlude3d", "HOOK scan: matches=%d  [0]=0x%08X [1]=0x%08X [2]=0x%08X [3]=0x%08X",
+    this->HookDetail("HOOK scan: matches=%d  [0]=0x%08X [1]=0x%08X [2]=0x%08X [3]=0x%08X",
         found, static_cast<uint32_t>(firstAddrs[0]), static_cast<uint32_t>(firstAddrs[1]),
         static_cast<uint32_t>(firstAddrs[2]), static_cast<uint32_t>(firstAddrs[3]));
 
     if (found != 1)
-        this->m_LogManager->Logf(static_cast<uint32_t>(Ashita::LogLevel::Warn), "occlude3d",
+        this->LogF(static_cast<uint32_t>(Ashita::LogLevel::Warn), "occlude3d",
             "HOOK: expected exactly 1 signature match but found %d -- using [0]=0x%08X; verify against this client.",
             found, static_cast<uint32_t>(firstAddrs[0]));
 
@@ -326,7 +405,7 @@ uintptr_t occlude3d::ResolveNameDraw(void)
         off += _snprintf_s(line + off, sizeof(line) - off, _TRUNCATE, "HOOK [%d] @0x%08X:", k, static_cast<uint32_t>(firstAddrs[k]));
         for (int i = 0; i < 56 && off < static_cast<int>(sizeof(line)) - 4; ++i)
             off += _snprintf_s(line + off, sizeof(line) - off, _TRUNCATE, " %02X", p[i]);
-        this->m_LogManager->Log(LL, "occlude3d", line);
+        this->HookDetail("%s", line);
     }
 
     return this->m_NameDrawAddr;
@@ -341,18 +420,23 @@ bool occlude3d::InstallHook(uintptr_t addr)
 
     if (*reinterpret_cast<const uint8_t*>(addr) != 0xA1)
     {
-        if (this->m_LogManager)
-            this->m_LogManager->Logf(static_cast<uint32_t>(Ashita::LogLevel::Warn), "occlude3d",
-                "HOOK: prologue at 0x%08X is 0x%02X, expected 0xA1 (mov eax,[imm32]) -- refusing to splice an unexpected instruction.",
-                static_cast<uint32_t>(addr), *reinterpret_cast<const uint8_t*>(addr));
-        return false;
+        this->LogF(static_cast<uint32_t>(Ashita::LogLevel::Warn), "occlude3d",
+            "HOOK: prologue at 0x%08X is 0x%02X, expected 0xA1 (mov eax,[imm32]) -- refusing to splice an unexpected instruction.",
+            static_cast<uint32_t>(addr), *reinterpret_cast<const uint8_t*>(addr));
+        { this->FlushHookDetail(); return false; }
     }
 
-    uint8_t* tramp = static_cast<uint8_t*>(VirtualAlloc(nullptr, 16, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE));
+    // A trampoline from an earlier hook at the same address (same pinned image, clean unload) is reused; one for another
+    // address stays allocated (a thread may still be in it) and a new one is made.
+    uint8_t* tramp = (g_trampoline != nullptr && g_hookAddr == addr) ? static_cast<uint8_t*>(g_trampoline) : nullptr;
     if (tramp == nullptr)
     {
-        if (this->m_LogManager) this->m_LogManager->Log(LL, "occlude3d", "HOOK: VirtualAlloc failed.");
-        return false;
+        tramp = static_cast<uint8_t*>(VirtualAlloc(nullptr, 16, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE));
+        if (tramp == nullptr)
+        {
+            this->LogLine(LL, "occlude3d", "HOOK: VirtualAlloc failed.");
+            { this->FlushHookDetail(); return false; }
+        }
     }
 
     uint8_t* target = reinterpret_cast<uint8_t*>(addr);
@@ -360,61 +444,159 @@ bool occlude3d::InstallHook(uintptr_t addr)
     memcpy(tramp, g_origBytes, 5);
     tramp[5] = 0xE9;
     *reinterpret_cast<int32_t*>(tramp + 6) = static_cast<int32_t>((addr + 5) - (reinterpret_cast<uintptr_t>(tramp) + 10));
+    FlushInstructionCache(GetCurrentProcess(), tramp, 10);
 
-    g_trampoline = tramp;
+    // From the first byte written into the client this DLL stays mapped until the game closes: no thread can reach
+    // unmapped code through the entry JMP, the stub or the trampoline, whatever happens at unload.
+    if (!g_pinned) g_pinned = occ::pinSelf(reinterpret_cast<const void*>(&hook_OnMove));
+    if (!g_pinned)
+    {
+        this->LogF(static_cast<uint32_t>(Ashita::LogLevel::Error), "occlude3d", "HOOK: could not pin this DLL (error %lu); the hook is not installed.", GetLastError());
+        this->WriteChat("could not keep itself loaded, so the occlusion hook is not installed.", 0x44);
+        if (tramp != g_trampoline) VirtualFree(tramp, 0, MEM_RELEASE);   // never published
+        { this->FlushHookDetail(); return false; }
+    }
+
+    g_trampoline = tramp;   // published before the entry JMP so the stub's jmp [g_trampoline] is valid at once
     g_hookAddr   = addr;
     g_hookCalls  = 0;
     g_instance   = this;
 
-    DWORD oldProt = 0;
-    if (!VirtualProtect(target, 5, PAGE_EXECUTE_READWRITE, &oldProt))
+    uint8_t jump[5] = { 0xE9 };
+    *reinterpret_cast<int32_t*>(jump + 1) = static_cast<int32_t>(reinterpret_cast<uintptr_t>(&hook_OnMove) - (addr + 5));
+    // The 5-byte JMP replaces one 5-byte instruction (mov eax,[imm32]): a partial write would be a mov from a wrong
+    // address, so the write happens with every other thread suspended and none of them at the entry.
+    const occ::CodeRange entry[1] = { { addr, addr + 5 } };
+    bool wrote = false, protectFailed = false;
+    char why[600] = "";
+    const bool quiet = occ::whenNoThreadIn(entry, 1, nullptr, 0, 500, [&]
     {
-        if (this->m_LogManager) this->m_LogManager->Log(LL, "occlude3d", "HOOK: VirtualProtect failed.");
-        VirtualFree(tramp, 0, MEM_RELEASE);
-        g_trampoline = nullptr;
-        return false;
+        DWORD oldProt = 0;
+        if (!VirtualProtect(target, 5, PAGE_EXECUTE_READWRITE, &oldProt)) { protectFailed = true; return; }
+        memcpy(target, jump, 5);
+        VirtualProtect(target, 5, oldProt, &oldProt);
+        FlushInstructionCache(GetCurrentProcess(), target, 5);
+        wrote = occ::bytesAre(addr, jump, 5);
+    }, why, sizeof why);
+    if (!quiet || protectFailed)
+    {
+        this->LogLine(static_cast<uint32_t>(Ashita::LogLevel::Warn), "occlude3d", !quiet ? "HOOK: no moment without a thread at the entry came in 0.5 s; not installed." : "HOOK: VirtualProtect failed.");
+        if (!quiet) { char line[700]; _snprintf_s(line, sizeof line, _TRUNCATE, "HOOK: last try: %s", why); this->LogLine(LL, "occlude3d", line); }
+        if (this->m_Repeats.first("hook install"))
+        {
+            this->m_WarnedUnhooked = true;   // this is the warning; the "geometry submitted" one would repeat it
+            this->WriteChat("the occlusion hook could not be installed; nothing it draws will show. Try /o3d hook.", 0x44);
+        }
+        g_instance = nullptr;
+        { this->FlushHookDetail(); return false; }
     }
-    target[0] = 0xE9;
-    *reinterpret_cast<int32_t*>(target + 1) = static_cast<int32_t>(reinterpret_cast<uintptr_t>(&hook_OnMove) - (addr + 5));
-    VirtualProtect(target, 5, oldProt, &oldProt);
-    FlushInstructionCache(GetCurrentProcess(), target, 5);
+    if (!wrote)
+    {
+        this->LogLine(static_cast<uint32_t>(Ashita::LogLevel::Error), "occlude3d", "HOOK: the entry does not read back as our jump; treating the hook as installed and retained.");
+        g_installed = true;
+        g_retained  = true;
+        this->m_Hooked = true;
+        { this->FlushHookDetail(); return false; }
+    }
 
     g_installed   = true;
     this->m_Hooked = true;
     this->m_WarnedUnhooked = false;
-    if (this->m_LogManager)
-        this->m_LogManager->Logf(LL, "occlude3d", "HOOK installed at 0x%08X (trampoline 0x%08X).",
-            static_cast<uint32_t>(addr), static_cast<uint32_t>(reinterpret_cast<uintptr_t>(tramp)));
+    this->LogF(LL, "occlude3d", "HOOK installed at 0x%08X (trampoline 0x%08X).",
+        static_cast<uint32_t>(addr), static_cast<uint32_t>(reinterpret_cast<uintptr_t>(tramp)));
     return true;
 }
 
+// Puts the client's entry back with every other thread suspended, at a moment when none of them is inside this DLL,
+// the entry instruction or the trampoline (a thread part-way through the stub or about to return into the entry would
+// otherwise run a half-restored instruction). Only our own JMP is overwritten: bytes someone else put there are left
+// alone. The trampoline is never freed. Whatever the outcome the DLL is pinned, so the stub stays valid; it does nothing
+// once g_instance is null.
 void occlude3d::RemoveHook(void)
 {
     if (!g_installed)
         return;
 
-    uint8_t* target = reinterpret_cast<uint8_t*>(g_hookAddr);
-    DWORD oldProt = 0;
-    if (VirtualProtect(target, 5, PAGE_EXECUTE_READWRITE, &oldProt))
+    const uintptr_t addr = g_hookAddr;
+    uint8_t jump[5] = { 0xE9 };
+    *reinterpret_cast<int32_t*>(jump + 1) = static_cast<int32_t>(reinterpret_cast<uintptr_t>(&hook_OnMove) - (addr + 5));
+
+    occ::CodeRange ranges[3];
+    size_t n = 0;
+    uintptr_t lo = 0, hi = 0;
+    if (occ::selfImage(reinterpret_cast<const void*>(&hook_OnMove), lo, hi)) ranges[n++] = occ::CodeRange{ lo, hi };
+    else ranges[n++] = occ::CodeRange{ 0, UINTPTR_MAX };   // unknown: treat every thread as busy
+    ranges[n++] = occ::CodeRange{ addr, addr + 5 };
+    if (g_trampoline != nullptr) ranges[n++] = occ::CodeRange{ reinterpret_cast<uintptr_t>(g_trampoline), reinterpret_cast<uintptr_t>(g_trampoline) + 10 };
+    const DWORD writers[1] = { g_log.threadId() };
+
+    // Up to 3 s of attempts, each with every other thread suspended: none may be in the DLL, at the entry or in the
+    // trampoline, and no hook call may be inside RenderHookDraw (it calls into Direct3D, outside every range, with a
+    // return into this DLL and the instance in hand: g_inFlight counts those).
+    bool owned = false, restored = false, quiet = false;
+    const ULONGLONG deadline = GetTickCount64() + 3000;
+    do
     {
-        memcpy(target, g_origBytes, 5);
-        VirtualProtect(target, 5, oldProt, &oldProt);
-        FlushInstructionCache(GetCurrentProcess(), target, 5);
-    }
-    g_instance = nullptr;
-    if (g_trampoline != nullptr)
+        bool busy = false;
+        const bool ran = occ::whenNoThreadIn(ranges, n, writers, 1, 1, [&]
+        {
+            // Nothing here allocates or logs: a suspended thread may hold the heap lock.
+            if (g_inFlight != 0) { busy = true; return; }
+            uint8_t* target = reinterpret_cast<uint8_t*>(addr);
+            owned = occ::bytesAre(addr, jump, 5);
+            if (!owned) { g_instance = nullptr; return; }
+            DWORD oldProt = 0;
+            if (VirtualProtect(target, 5, PAGE_EXECUTE_READWRITE, &oldProt))
+            {
+                memcpy(target, g_origBytes, 5);
+                VirtualProtect(target, 5, oldProt, &oldProt);
+                FlushInstructionCache(GetCurrentProcess(), target, 5);
+            }
+            restored = occ::bytesAre(addr, g_origBytes, 5);
+            g_instance = nullptr;   // no thread is in the stub or holds the instance now
+        });
+        quiet = ran && !busy;
+        if (!quiet) Sleep(1);
+    } while (!quiet && GetTickCount64() < deadline);
+
+    if (quiet && restored)
     {
-        VirtualFree(g_trampoline, 0, MEM_RELEASE);
-        g_trampoline = nullptr;
+        g_installed = false;
+        g_retained  = false;
+        g_keepInstance = false;   // no hook call holds the instance now: an earlier timeout no longer applies
+        this->LogF(static_cast<uint32_t>(Ashita::LogLevel::Info), "occlude3d",
+            "HOOK removed at 0x%08X. Total OnMove calls observed: %u", static_cast<uint32_t>(addr), g_hookCalls);
     }
-    g_installed   = false;
+    else
+    {
+        // The hook stays in: its stub passes straight through to the retained trampoline. A later load is refused.
+        g_retained = true;
+        if (!quiet)
+        {
+            // A caller may still hold the instance (stalled inside Direct3D). Nothing it can reach is freed: the instance
+            // object, its textures and fonts are kept for the rest of the session (expDestroyPlugin skips the delete).
+            g_keepInstance = true;
+            this->LogLine(static_cast<uint32_t>(Ashita::LogLevel::Error), "occlude3d",
+                "HOOK not removed: no moment without a game thread inside the hook came within 3 s; the entry jump stays in and the instance is kept until the game closes.");
+            this->WriteChat("could not remove its hook safely; it stays in until you close the game. Restart the game to load occlude3d again.", 0x44);
+        }
+        else if (!owned)
+        {
+            this->LogF(static_cast<uint32_t>(Ashita::LogLevel::Error), "occlude3d",
+                "HOOK not removed: the entry at 0x%08X holds bytes occlude3d did not write (another tool hooked it); left alone.", static_cast<uint32_t>(addr));
+            this->WriteChat("something else has rewritten the hook site; occlude3d left it alone. Restart the game to load occlude3d again.", 0x44);
+        }
+        else
+        {
+            this->LogF(static_cast<uint32_t>(Ashita::LogLevel::Error), "occlude3d",
+                "HOOK not removed: the restore at 0x%08X did not read back (protection?); the jump stays in until the game closes.", static_cast<uint32_t>(addr));
+            this->WriteChat("could not put the game code back; its hook stays in (harmless) until you close the game.", 0x44);
+        }
+    }
     this->m_Hooked = false;
-    if (this->m_LogManager)
-        this->m_LogManager->Logf(static_cast<uint32_t>(Ashita::LogLevel::Info), "occlude3d",
-            "HOOK removed. Total OnMove calls observed: %u", g_hookCalls);
 }
 
-void occlude3d::HandleEvent(const char* eventName, const void* eventData, const uint32_t eventSize)
+void occlude3d::HandleEventBody(const char* eventName, const void* eventData, const uint32_t eventSize)
 {
     if (eventName == nullptr || eventData == nullptr) return;
     if (strcmp(eventName, "occlude3d") != 0) return;
@@ -479,14 +661,37 @@ void occlude3d::HandleEvent(const char* eventName, const void* eventData, const 
     }
 
     SubOwner& o = this->m_Owners[slot];
-    if (o.used)
+    // The owner holds one reference per distinct texture in its buffer. Replacing the buffer references
+    // only the textures that are new and releases only the ones that are gone: most frames resubmit the
+    // same textures, and every reference change costs several ReadProcessMemory validations.
+    static uint32_t oldTex[kMaxBufTextures], newTex[kMaxBufTextures];
+    const int nOld = (this->m_Legacy || !o.used) ? 0 : CollectBufferTextures(o.buf, o.size, oldTex, kMaxBufTextures);
+    const int nNew = this->m_Legacy ? -1 : CollectBufferTextures(p, eventSize, newTex, kMaxBufTextures);
+    const bool diff = nOld >= 0 && nNew >= 0;
+    if (!diff && o.used)
         this->RefBufferTextures(o.buf, o.size, false);
     o.used   = true;
     o.id     = owner;
     o.expire = GetTickCount() + ttl;
     o.size   = eventSize;
     memcpy(o.buf, p, eventSize);
-    this->RefBufferTextures(o.buf, o.size, true);
+    if (diff)
+    {
+        for (int i = 0; i < nNew; ++i)
+        {
+            bool had = false;
+            for (int j = 0; j < nOld; ++j) if (oldTex[j] == newTex[i]) { had = true; break; }
+            if (!had) this->RefTexture(newTex[i], true);
+        }
+        for (int j = 0; j < nOld; ++j)
+        {
+            bool kept = false;
+            for (int i = 0; i < nNew; ++i) if (newTex[i] == oldTex[j]) { kept = true; break; }
+            if (!kept) this->RefTexture(oldTex[j], false);
+        }
+    }
+    else
+        this->RefBufferTextures(o.buf, o.size, true);
 
     if (!this->m_Hooked && !this->m_TriedAutoHook)
     {
@@ -499,9 +704,8 @@ void occlude3d::HandleEvent(const char* eventName, const void* eventData, const 
     if (!this->m_Hooked && this->m_TriedAutoHook && !this->m_WarnedUnhooked)
     {
         this->m_WarnedUnhooked = true;
-        if (this->m_LogManager != nullptr)
-            this->m_LogManager->Log(static_cast<uint32_t>(Ashita::LogLevel::Warn), "occlude3d",
-                "Geometry submitted but the occlusion hook is not installed -- nothing will render. Try '/o3d hook' (status in /o3d).");
+        this->LogLine(static_cast<uint32_t>(Ashita::LogLevel::Warn), "occlude3d",
+            "Geometry submitted but the occlusion hook is not installed -- nothing will render. Try '/o3d hook' (status in /o3d).");
         this->WriteChat("geometry submitted but the occlusion hook isn't installed -- nothing will render. Try /o3d hook.", 0x44);
     }
 
@@ -510,6 +714,22 @@ void occlude3d::HandleEvent(const char* eventName, const void* eventData, const 
         LARGE_INTEGER _ee; QueryPerformanceCounter(&_ee);
         this->m_EventMs   += static_cast<double>(_ee.QuadPart - _es.QuadPart) * 1000.0 / static_cast<double>(this->m_QpcFreq);
         this->m_BytesAcc  += static_cast<double>(eventSize);
+    }
+}
+
+void occlude3d::HandleEvent(const char* eventName, const void* eventData, const uint32_t eventSize)
+{
+    try
+    {
+        this->HandleEventBody(eventName, eventData, eventSize);
+    }
+    catch (...)
+    {
+        if (this->m_Repeats.first("event error"))
+        {
+            g_log.write("error", "HandleEvent: an unexpected error");
+            this->WriteChat("a submission failed with an unexpected error.", 0x44);
+        }
     }
 }
 
@@ -600,6 +820,31 @@ static bool DecodeItem(uint32_t type, const uint8_t* b, uint32_t pos, uint32_t e
     return true;
 }
 
+// Distinct texture pointers in a submission buffer, in first-seen order, parsed exactly as
+// RefBufferTextures parses them. Returns -1 when there are more than `cap`.
+int occlude3d::CollectBufferTextures(const uint8_t* b, uint32_t size, uint32_t* out, int cap)
+{
+    if (b == nullptr || size < 20)
+        return 0;
+    const uint32_t end = size;
+    uint32_t pos = 16, items = 0; memcpy(&items, b + 12, 4);
+    int n = 0;
+    for (uint32_t it = 0; it < items && pos + 4 <= end; ++it)
+    {
+        uint32_t tw = 0; memcpy(&tw, b + pos, 4); pos += 4;
+        uint32_t bodyLen = 0, tp = 0;
+        if (!DecodeItem(tw & 0xFFu, b, pos, end, &bodyLen, &tp)) break;
+        pos += bodyLen;
+        if (tp == 0) continue;
+        bool dup = false;
+        for (int s = 0; s < n; ++s) { if (out[s] == tp) { dup = true; break; } }
+        if (dup) continue;
+        if (n >= cap) return -1;
+        out[n++] = tp;
+    }
+    return n;
+}
+
 void occlude3d::RefBufferTextures(const uint8_t* b, uint32_t size, bool addref)
 {
     if (b == nullptr || size < 20)
@@ -630,13 +875,39 @@ const occlude3d::Font* occlude3d::FindFont(uint32_t id) const
     return nullptr;
 }
 
-void occlude3d::WriteChat(const char* body, uint8_t bodyColor)
+void occlude3d::LogLine(uint32_t level, const char*, const char* text)
 {
-    if (this->m_AshitaCore == nullptr || this->m_AshitaCore->GetChatManager() == nullptr || body == nullptr)
-        return;
-    char buffer[256];
+    g_log.write(levelName(level), text);
+}
+void occlude3d::LogF(uint32_t level, const char*, const char* fmt, ...)
+{
+    char buf[1024];
+    va_list ap;
+    va_start(ap, fmt);
+    _vsnprintf_s(buf, sizeof buf, _TRUNCATE, fmt, ap);
+    va_end(ap);
+    g_log.write(levelName(level), buf);
+}
+
+void occlude3d::WriteChat(const char* body, uint8_t bodyColor, bool log)
+{
+    if (body == nullptr) return;
+    std::string text = body;
+    if (bodyColor == 0x44) text += " Details: " + this->LogShown() + this->LogNote();
+    if (log)
+    {
+        std::string plain;
+        for (size_t i = 0; i < text.size(); ++i)
+        {
+            if (text[i] == '\x1E') { ++i; continue; }   // a colour escape and its colour byte
+            plain += text[i];
+        }
+        g_log.write(bodyColor == 0x44 ? "warn" : "info", plain);
+    }
+    if (this->m_AshitaCore == nullptr || this->m_AshitaCore->GetChatManager() == nullptr) return;
+    char buffer[400];
     _snprintf_s(buffer, sizeof(buffer), _TRUNCATE,
-        "\x1E\x51" "[" "\x1E\x06" "occlude3d" "\x1E\x51" "]" "\x1E\x01" " " "\x1E%c" "%s" "\x1E\x01", bodyColor, body);
+        "\x1E\x51" "[" "\x1E\x06" "occlude3d" "\x1E\x51" "]" "\x1E\x01" " " "\x1E%c" "%s" "\x1E\x01", bodyColor, text.c_str());
     this->m_AshitaCore->GetChatManager()->AddChatMessage(1, false, buffer);
 }
 
@@ -649,19 +920,120 @@ static void FourCC(uint32_t id, char out[5])
 
 void occlude3d::WarnDrop(int cat, const char* reason, uint32_t owner)
 {
-    if (cat < 0 || cat > 2) cat = 0;
-    const uint32_t now = GetTickCount();
-    if (this->m_DropWarnTick[cat] != 0 && (now - this->m_DropWarnTick[cat]) < 5000)
-        return;
-    this->m_DropWarnTick[cat] = now;
+    UNREFERENCED_PARAMETER(cat);
     char fc[5]; FourCC(owner, fc);
-    if (this->m_LogManager != nullptr)
-        this->m_LogManager->Logf(static_cast<uint32_t>(Ashita::LogLevel::Warn), "occlude3d",
-            "DROP from owner '%s' (0x%08X): %s. [totals: oversize=%u noSlot=%u badItem=%u]",
-            fc, owner, reason, this->m_DropOversize, this->m_DropNoSlot, this->m_DropBadItem);
+    char cause[200];
+    _snprintf_s(cause, sizeof(cause), _TRUNCATE, "dropped submissions from '%s' (%s)", fc, reason);
+    if (!this->m_Repeats.first(cause)) return;   // said once per cause; the count is written at unload
+    this->LogF(static_cast<uint32_t>(Ashita::LogLevel::Warn), "occlude3d",
+        "DROP from owner '%s' (0x%08X): %s. [totals: oversize=%u noSlot=%u badItem=%u]",
+        fc, owner, reason, this->m_DropOversize, this->m_DropNoSlot, this->m_DropBadItem);
     char cm[224];
     _snprintf_s(cm, sizeof(cm), _TRUNCATE, "dropped a submission from '%s' -- %s", fc, reason);
     this->WriteChat(cm, 0x44);
+}
+
+void occlude3d::HookDetail(const char* fmt, ...)
+{
+    char buf[1024];
+    va_list ap;
+    va_start(ap, fmt);
+    _vsnprintf_s(buf, sizeof buf, _TRUNCATE, fmt, ap);
+    va_end(ap);
+    this->m_HookDetail.emplace_back(buf);
+}
+
+// The install failed: the scan detail goes into the log after all.
+void occlude3d::FlushHookDetail(void)
+{
+    for (const auto& line : this->m_HookDetail) g_log.write("info", line);
+}
+
+std::string occlude3d::LogShown(void) { return plog::underRoot(this->m_Root, g_log.path()); }
+const char* occlude3d::LogNote(void) { return g_log.atStartupFile() ? " (it moves into your character's log at login)" : ""; }
+
+void occlude3d::FollowCharacter(void)
+{
+    if (this->m_AshitaCore == nullptr) return;
+    IMemoryManager* mm = this->m_AshitaCore->GetMemoryManager();
+    IPlayer* player = mm != nullptr ? mm->GetPlayer() : nullptr;
+    IParty* party = mm != nullptr ? mm->GetParty() : nullptr;
+    if (player == nullptr || party == nullptr || player->GetLoginStatus() != 2) return;
+    const char* name = party->GetMemberName(0);
+    const uint32_t serverId = party->GetMemberServerId(0);
+    if (name == nullptr || name[0] == '\0' || serverId == 0) return;
+    const std::string key = plog::characterKey(name, serverId);
+    if (key == this->m_CharKey) return;
+    if (this->m_Shot != 0) this->FinishShot();   // a report still waiting goes to the log it was asked in
+    this->m_CharKey = key;
+    g_log.moveToCharacter(plog::characterLogPath(this->m_Root, "occlude3d", key), name);
+}
+
+void occlude3d::StartShot(int kind)
+{
+    if (this->m_Shot != 0) { this->WriteChat("already measuring; the result comes in a moment."); return; }
+    this->ResetStatAccumulators();
+    this->m_Shot = kind;
+    this->m_ShotStart = GetTickCount64();
+}
+
+// The stats line, or the diag report as one block, from what the frames measured.
+void occlude3d::FinishShot(void)
+{
+    const int kind = this->m_Shot;
+    this->m_Shot = 0;
+    const uint32_t frames = this->m_StatFrames;
+    const double n = frames > 0 ? static_cast<double>(frames) : 1.0;
+    char stats[400];
+    if (frames == 0)
+        _snprintf_s(stats, sizeof stats, _TRUNCATE, "stats: no frames were drawn by the hook (hook %s)", this->m_Hooked ? "installed, nothing submitted" : "not installed");
+    else
+        _snprintf_s(stats, sizeof stats, _TRUNCATE,
+            "stats over %u frames: items %.0f, owners %.1f, state calls %.0f, draw calls %.0f, draw CPU %.3f ms (slowest %.3f ms), receive CPU %.3f ms, bytes %.0f",
+            frames, this->m_ItemsAcc / n, this->m_OwnersAcc / n, this->m_StateAcc / n, this->m_DrawsAcc / n,
+            this->m_HookMs / n, this->m_StatWorstMs, this->m_EventMs / n, this->m_BytesAcc / n);
+    this->ResetStatAccumulators();
+    if (kind == 1)
+    {
+        this->WriteChat(stats);   // mirrored to the log
+        return;
+    }
+    std::string body;
+    auto add = [&body](const char* fmt, ...)
+    {
+        char line[600];
+        va_list ap;
+        va_start(ap, fmt);
+        _vsnprintf_s(line, sizeof line, _TRUNCATE, fmt, ap);
+        va_end(ap);
+        body += "      ";
+        body += line;
+        body += '\n';
+    };
+    add("plugin    occlude3d v%.1f  (interface %.2f)", OCCLUDE3D_VERSION, ASHITA_INTERFACE_VERSION);
+    add("device    0x%p", static_cast<void*>(this->m_Device));
+    if (this->m_Hooked)
+        add("hook      installed at 0x%08X, trampoline 0x%08X, calls seen %u, legacy %s", static_cast<uint32_t>(g_hookAddr),
+            static_cast<uint32_t>(reinterpret_cast<uintptr_t>(g_trampoline)), g_hookCalls, this->m_Legacy ? "on" : "off");
+    else
+        add("hook      not installed (%d signature match(es)), legacy %s", this->m_HookMatches, this->m_Legacy ? "on" : "off");
+    add("%s", stats);
+    for (int i = 0; i < kMaxOwners; ++i)
+    {
+        if (!this->m_Owners[i].used) continue;
+        char fc[5]; FourCC(this->m_Owners[i].id, fc);
+        add("addon     '%s' (0x%08X): %u bytes submitted", fc, this->m_Owners[i].id, this->m_Owners[i].size);
+    }
+    char dfc[5]; FourCC(this->m_LastDropOwner, dfc);
+    add("drops     oversize %u, no slot %u, bad item %u, bad texture %u; last from '%s'",
+        this->m_DropOversize, this->m_DropNoSlot, this->m_DropBadItem, this->m_DropBadTex, dfc);
+    for (const auto& line : this->m_HookDetail) add("%s", line.c_str());
+    char who[96];
+    _snprintf_s(who, sizeof who, _TRUNCATE, "occlude3d %.1f build %08X", OCCLUDE3D_VERSION, plog::ownImageStamp(reinterpret_cast<const void*>(&hook_OnMove)));
+    g_log.writeDiag(who, body);
+    char chatLine[300];
+    _snprintf_s(chatLine, sizeof chatLine, _TRUNCATE, "Diagnostics written to %s%s.", this->LogShown().c_str(), this->LogNote());
+    this->WriteChat(chatLine);
 }
 
 void occlude3d::DrawSubmittedGuarded(IDirect3DDevice8* dev)
@@ -679,7 +1051,7 @@ void occlude3d::DrawSubmittedGeometry(IDirect3DDevice8* dev)
 {
     struct V { float x, y, z; D3DCOLOR c; };
     const uint32_t now = GetTickCount();
-    this->m_FrameItems = 0; this->m_FrameOwners = 0; this->m_FrameState = 0;
+    this->m_FrameItems = 0; this->m_FrameOwners = 0; this->m_FrameState = 0; this->m_FrameDraws = 0;
 
     D3DMATRIX view;
     dev->GetTransform(D3DTS_VIEW, &view);
@@ -700,45 +1072,135 @@ void occlude3d::DrawSubmittedGeometry(IDirect3DDevice8* dev)
     static V           strip[kMaxRibPts * 2];
     static VT          tstrip[kMaxRibPts * 2];
 
-    static const int kBatchMax = 8192;
-    static VT        batch[kBatchMax];
-    int      batchN = 0, batchStage = -1;
-    uint32_t batchTex = 0, batchFlags = 0;
-
-    auto flush = [&]() {
-        if (batchN >= 3 && batchStage >= 0)
-        {
-            dev->SetRenderState(D3DRS_ZFUNC,     D3DCMP_LESSEQUAL);
-            dev->SetRenderState(D3DRS_DESTBLEND, (batchFlags & 0x01u) ? D3DBLEND_ONE  : D3DBLEND_INVSRCALPHA);
-            dev->SetRenderState(D3DRS_ZWRITEENABLE,    (batchFlags & 0x04u) ? TRUE : FALSE);
-            dev->SetRenderState(D3DRS_ALPHATESTENABLE, (batchFlags & 0x04u) ? TRUE : FALSE);
-            dev->SetTexture(0, reinterpret_cast<IDirect3DBaseTexture8*>(static_cast<uintptr_t>(batchTex)));
-            if (batchStage == 0) {
-                dev->SetTextureStageState(0, D3DTSS_COLOROP,   D3DTOP_BLENDTEXTUREALPHA);
-                dev->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_TEXTURE);
-                dev->SetTextureStageState(0, D3DTSS_COLORARG2, D3DTA_DIFFUSE);
-                dev->SetTextureStageState(0, D3DTSS_ALPHAOP,   D3DTOP_SELECTARG1);
-                dev->SetTextureStageState(0, D3DTSS_ALPHAARG1, D3DTA_TEXTURE);
-                this->m_FrameState += 15;
-            } else {
-                dev->SetTextureStageState(0, D3DTSS_COLOROP,   D3DTOP_MODULATE);
-                dev->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_TEXTURE);
-                dev->SetTextureStageState(0, D3DTSS_COLORARG2, D3DTA_DIFFUSE);
-                dev->SetTextureStageState(0, D3DTSS_ALPHAOP,   D3DTOP_MODULATE);
-                dev->SetTextureStageState(0, D3DTSS_ALPHAARG1, D3DTA_TEXTURE);
-                dev->SetTextureStageState(0, D3DTSS_ALPHAARG2, D3DTA_DIFFUSE);
-                this->m_FrameState += 16;
-            }
-            dev->SetVertexShader(D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1);
-            dev->DrawPrimitiveUP(D3DPT_TRIANGLELIST, batchN / 3, batch, sizeof(VT));
-            dev->SetTexture(0, nullptr);
+    // Device state for this hook invocation. RenderHookDrawInner has just set a known state (colored
+    // stage, no texture, XYZ|DIFFUSE, ZWRITE/ALPHATEST off, DESTBLEND INVSRCALPHA, ZFUNC LESSEQUAL), and
+    // nothing else touches the device until we return, so a setter is issued only when its value changes.
+    // Only the 0x01 (additive) and 0x04 (depth write) flag bits reach device state.
+    // Legacy mode (/o3d legacy on) re-issues every setter, draws each colored item on its own, breaks
+    // textured batches on the full flags (not just the 0x05 bits) and unbinds the texture after every
+    // textured batch -- the call pattern before batching -- so the two can be timed against each other
+    // in one session.
+    const bool legacy = this->m_Legacy;
+    uint32_t curFlags = 0u;
+    int      curStage = -1;          // -1 colored, 0 texture colour blended by texture alpha, 1 modulate
+    uint32_t curTex   = 0u;
+    DWORD    curFvf   = D3DFVF_XYZ | D3DFVF_DIFFUSE;
+    auto applyFlags = [&](uint32_t fl) {
+        const uint32_t f = fl & 0x05u;
+        if (legacy) { dev->SetRenderState(D3DRS_ZFUNC, D3DCMP_LESSEQUAL); curFlags = ~f; this->m_FrameState += 1; }
+        if ((f ^ curFlags) & 0x01u) {
+            dev->SetRenderState(D3DRS_DESTBLEND, (f & 0x01u) ? D3DBLEND_ONE : D3DBLEND_INVSRCALPHA);
+            this->m_FrameState += 1;
+        }
+        if ((f ^ curFlags) & 0x04u) {
+            dev->SetRenderState(D3DRS_ZWRITEENABLE,    (f & 0x04u) ? TRUE : FALSE);
+            dev->SetRenderState(D3DRS_ALPHATESTENABLE, (f & 0x04u) ? TRUE : FALSE);
+            this->m_FrameState += 2;
+        }
+        curFlags = f;
+    };
+    auto applyStage = [&](int st) {
+        if (st == curStage && !legacy) return;
+        if (st == 0) {
+            dev->SetTextureStageState(0, D3DTSS_COLOROP,   D3DTOP_BLENDTEXTUREALPHA);
+            dev->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_TEXTURE);
+            dev->SetTextureStageState(0, D3DTSS_COLORARG2, D3DTA_DIFFUSE);
+            dev->SetTextureStageState(0, D3DTSS_ALPHAOP,   D3DTOP_SELECTARG1);
+            dev->SetTextureStageState(0, D3DTSS_ALPHAARG1, D3DTA_TEXTURE);
+            this->m_FrameState += 5;
+        } else if (st == 1) {
+            dev->SetTextureStageState(0, D3DTSS_COLOROP,   D3DTOP_MODULATE);
+            dev->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_TEXTURE);
+            dev->SetTextureStageState(0, D3DTSS_COLORARG2, D3DTA_DIFFUSE);
+            dev->SetTextureStageState(0, D3DTSS_ALPHAOP,   D3DTOP_MODULATE);
+            dev->SetTextureStageState(0, D3DTSS_ALPHAARG1, D3DTA_TEXTURE);
+            dev->SetTextureStageState(0, D3DTSS_ALPHAARG2, D3DTA_DIFFUSE);
+            this->m_FrameState += 6;
+        } else {
+            // Colored: both colour and alpha come from the vertex, so whatever texture is still bound is
+            // never sampled and does not need unbinding.
             dev->SetTextureStageState(0, D3DTSS_COLOROP,   D3DTOP_SELECTARG1);
             dev->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_DIFFUSE);
             dev->SetTextureStageState(0, D3DTSS_ALPHAOP,   D3DTOP_SELECTARG1);
             dev->SetTextureStageState(0, D3DTSS_ALPHAARG1, D3DTA_DIFFUSE);
-            dev->SetVertexShader(D3DFVF_XYZ | D3DFVF_DIFFUSE);
+            this->m_FrameState += 4;
+        }
+        curStage = st;
+    };
+    auto applyTex = [&](uint32_t tp) {
+        if (tp == curTex && !legacy) return;
+        dev->SetTexture(0, reinterpret_cast<IDirect3DBaseTexture8*>(static_cast<uintptr_t>(tp)));
+        curTex = tp; this->m_FrameState += 1;
+    };
+    auto applyFvf = [&](DWORD f) {
+        if (f == curFvf && !legacy) return;
+        dev->SetVertexShader(f);
+        curFvf = f; this->m_FrameState += 1;
+    };
+    // Colored stage + FVF, set only if not already current (legacy mode also left them in place here).
+    auto colorStage = [&]() {
+        if (curStage != -1) applyStage(-1);
+        if (curFvf != (D3DFVF_XYZ | D3DFVF_DIFFUSE)) applyFvf(D3DFVF_XYZ | D3DFVF_DIFFUSE);
+    };
+
+    // Two pending batches, at most one non-empty at a time, so items still reach the device in exactly
+    // the order they were submitted: appending to one batch first flushes the other.
+    static const int kBatchMax = 8192;
+    static VT        batch[kBatchMax];     // textured triangles
+    static V         cbatch[kBatchMax];    // colored triangles
+    int      batchN = 0, batchStage = -1, cbatchN = 0;
+    uint32_t batchTex = 0, batchFlags = 0, cbatchFlags = 0;
+
+    auto flushTex = [&]() {
+        if (batchN >= 3 && batchStage >= 0)
+        {
+            applyFlags(batchFlags); applyTex(batchTex); applyStage(batchStage);
+            applyFvf(D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1);
+            dev->DrawPrimitiveUP(D3DPT_TRIANGLELIST, batchN / 3, batch, sizeof(VT));
+            this->m_FrameDraws++;
+            if (legacy) { applyTex(0); applyStage(-1); applyFvf(D3DFVF_XYZ | D3DFVF_DIFFUSE); }
         }
         batchN = 0; batchStage = -1;
+    };
+    auto flushCol = [&]() {
+        if (cbatchN >= 3)
+        {
+            applyFlags(cbatchFlags); colorStage();
+            dev->DrawPrimitiveUP(D3DPT_TRIANGLELIST, cbatchN / 3, cbatch, sizeof(V));
+            this->m_FrameDraws++;
+        }
+        cbatchN = 0;
+    };
+    auto flush = [&]() { flushTex(); flushCol(); };
+    // Open (or continue) a textured batch that has room for `need` more vertices.
+    auto texBegin = [&](uint32_t tp, uint32_t fl, int stage, int need) {
+        flushCol();
+        const uint32_t f = legacy ? fl : (fl & 0x05u);
+        if (batchStage != stage || batchTex != tp || batchFlags != f || batchN + need > kBatchMax) flushTex();
+        batchTex = tp; batchFlags = f; batchStage = stage;
+    };
+    // Append colored triangles (n vertices) to the colored batch.
+    auto colAppend = [&](const V* v, int n, uint32_t fl) {
+        if (n < 3) return;
+        flushTex();
+        const uint32_t f = fl & 0x05u;
+        if (cbatchN > 0 && (cbatchFlags != f || cbatchN + n > kBatchMax)) flushCol();
+        if (n > kBatchMax)
+        {
+            applyFlags(f); colorStage();
+            dev->DrawPrimitiveUP(D3DPT_TRIANGLELIST, n / 3, v, sizeof(V));
+            this->m_FrameDraws++;
+            return;
+        }
+        cbatchFlags = f;
+        memcpy(cbatch + cbatchN, v, static_cast<size_t>(n) * sizeof(V));
+        cbatchN += n;
+        if (legacy) flushCol();
+    };
+    // Prepare for an immediately-drawn colored primitive (lines, markers, ribbons).
+    auto immediate = [&](uint32_t fl) {
+        flush();
+        applyFlags(fl); colorStage();
     };
 
     auto prep = [&](float c[3], float& hw, float& hh, uint32_t fl)
@@ -750,19 +1212,12 @@ void occlude3d::DrawSubmittedGeometry(IDirect3DDevice8* dev)
         if ((fl & 0x08u) && pxFactor > 1e-3f) { const float s = d / pxFactor; hw *= s; hh *= s; }
         if (lyr > 0) { const float k = (static_cast<float>(lyr) * kLayerStep) / d; c[0]+=toe[0]*k; c[1]+=toe[1]*k; c[2]+=toe[2]*k; }
     };
-    auto colState = [&](uint32_t fl)
-    {
-        dev->SetRenderState(D3DRS_ZFUNC,     D3DCMP_LESSEQUAL);
-        dev->SetRenderState(D3DRS_DESTBLEND, (fl & 0x01u) ? D3DBLEND_ONE  : D3DBLEND_INVSRCALPHA);
-        dev->SetRenderState(D3DRS_ZWRITEENABLE,    (fl & 0x04u) ? TRUE : FALSE);
-        dev->SetRenderState(D3DRS_ALPHATESTENABLE, (fl & 0x04u) ? TRUE : FALSE);
-        this->m_FrameState += 2;
-    };
-    uint32_t goodTex[32]; int nGoodTex = 0;
+    static const int kGoodTexMax = 256;
+    uint32_t goodTex[kGoodTexMax]; int nGoodTex = 0;
     auto texOK = [&](uint32_t tp) -> bool {
         if (tp == 0) return false;
         for (int i = 0; i < nGoodTex; ++i) if (goodTex[i] == tp) return true;
-        if (ReadablePtr(tp)) { if (nGoodTex < 32) goodTex[nGoodTex++] = tp; return true; }
+        if (ReadablePtr(tp)) { if (nGoodTex < (legacy ? 32 : kGoodTexMax)) goodTex[nGoodTex++] = tp; return true; }
         this->m_DropBadTex++;
         return false;
     };
@@ -775,8 +1230,7 @@ void occlude3d::DrawSubmittedGeometry(IDirect3DDevice8* dev)
         if (texPtr != 0)
         {
             if (!texOK(texPtr)) return;
-            if (batchStage != 1 || batchTex != texPtr || batchFlags != fl || batchN + 6 > kBatchMax) flush();
-            batchTex = texPtr; batchFlags = fl; batchStage = 1;
+            texBegin(texPtr, fl, 1, 6);
             const VT q[6] = {
                 { cr[0][0],cr[0][1],cr[0][2], cTL,0,0 }, { cr[1][0],cr[1][1],cr[1][2], cTR,1,0 }, { cr[2][0],cr[2][1],cr[2][2], cBR,1,1 },
                 { cr[0][0],cr[0][1],cr[0][2], cTL,0,0 }, { cr[2][0],cr[2][1],cr[2][2], cBR,1,1 }, { cr[3][0],cr[3][1],cr[3][2], cBL,0,1 },
@@ -785,13 +1239,11 @@ void occlude3d::DrawSubmittedGeometry(IDirect3DDevice8* dev)
         }
         else
         {
-            flush();
-            colState(fl);
             const V q[6] = {
                 { cr[0][0],cr[0][1],cr[0][2], cTL }, { cr[1][0],cr[1][1],cr[1][2], cTR }, { cr[2][0],cr[2][1],cr[2][2], cBR },
                 { cr[0][0],cr[0][1],cr[0][2], cTL }, { cr[2][0],cr[2][1],cr[2][2], cBR }, { cr[3][0],cr[3][1],cr[3][2], cBL },
             };
-            dev->DrawPrimitiveUP(D3DPT_TRIANGLELIST, 2, q, sizeof(V));
+            colAppend(q, 6, fl);
         }
     };
 
@@ -823,11 +1275,8 @@ void occlude3d::DrawSubmittedGeometry(IDirect3DDevice8* dev)
             const uint32_t type  = typeWord & 0xFFu;
             const uint32_t flags = (typeWord >> 8) & 0xFFFFFFu;
 
-            if (type == 0 || type == 1 || type == 2 || type == 4)
-            {
-                flush();
-                colState(flags);
-            }
+            if (type == 0 || type == 1 || type == 2)
+                immediate(flags);
 
             if (type == 0)
             {
@@ -851,11 +1300,13 @@ void occlude3d::DrawSubmittedGeometry(IDirect3DDevice8* dev)
                             { bp[0]-s[0], bp[1]-s[1], bp[2]-s[2], col }, { bp[0]+s[0], bp[1]+s[1], bp[2]+s[2], col },
                         };
                         dev->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, q, sizeof(V));
+                        this->m_FrameDraws++;
                         continue;
                     }
                 }
                 const V v[2] = { { a[0],a[1],a[2], col }, { bp[0],bp[1],bp[2], col } };
                 dev->DrawPrimitiveUP(D3DPT_LINELIST, 1, v, sizeof(V));
+                this->m_FrameDraws++;
             }
             else if (type == 1)
             {
@@ -871,6 +1322,7 @@ void occlude3d::DrawSubmittedGeometry(IDirect3DDevice8* dev)
                     { a[0],a[1],a[2]-h, col }, { a[0],a[1],a[2]+h, col },
                 };
                 dev->DrawPrimitiveUP(D3DPT_LINELIST, 3, v, sizeof(V));
+                this->m_FrameDraws++;
             }
             else if (type == 2)
             {
@@ -898,6 +1350,7 @@ void occlude3d::DrawSubmittedGeometry(IDirect3DDevice8* dev)
                     strip[i*2+1] = { P[0]+s[0], P[1]+s[1], P[2]+s[2], col };
                 }
                 dev->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, np*2 - 2, strip, sizeof(V));
+                this->m_FrameDraws++;
             }
             else if (type == 3)
             {
@@ -929,8 +1382,7 @@ void occlude3d::DrawSubmittedGeometry(IDirect3DDevice8* dev)
                 }
                 if (!texOK(texPtr)) continue;
                 const int need = static_cast<int>(np - 1) * 6;
-                if (batchStage != 0 || batchTex != texPtr || batchFlags != flags || batchN + need > kBatchMax) flush();
-                batchTex = texPtr; batchFlags = flags; batchStage = 0;
+                texBegin(texPtr, flags, 0, need);
                 for (uint32_t i = 0; i + 1 < np && batchN + 6 <= kBatchMax; ++i)
                 {
                     const VT A = tstrip[i*2+0], B = tstrip[i*2+1], Cc = tstrip[(i+1)*2+0], D = tstrip[(i+1)*2+1];
@@ -946,7 +1398,7 @@ void occlude3d::DrawSubmittedGeometry(IDirect3DDevice8* dev)
                 const V* verts = reinterpret_cast<const V*>(b + pos);
                 pos += vc * 16;
                 { bool ok = true; for (uint32_t k = 0; ok && k < vc; ++k) ok = Finite(verts[k].x) && Finite(verts[k].y) && Finite(verts[k].z); if (!ok) continue; }
-                dev->DrawPrimitiveUP(D3DPT_TRIANGLELIST, vc / 3, verts, sizeof(V));
+                colAppend(verts, static_cast<int>(vc), flags);
             }
             else if (type == 5)
             {
@@ -958,8 +1410,7 @@ void occlude3d::DrawSubmittedGeometry(IDirect3DDevice8* dev)
                 pos += vc * 24;
                 { bool ok = true; for (uint32_t k = 0; ok && k < vc; ++k) ok = Finite(sv[k].x) && Finite(sv[k].y) && Finite(sv[k].z); if (!ok) continue; }
                 if (!texOK(texPtr)) continue;
-                if (batchStage != 1 || batchTex != texPtr || batchFlags != flags || batchN + static_cast<int>(vc) > kBatchMax) flush();
-                batchTex = texPtr; batchFlags = flags; batchStage = 1;
+                texBegin(texPtr, flags, 1, static_cast<int>(vc));
                 for (uint32_t k = 0; k < vc && batchN < kBatchMax; ++k) batch[batchN++] = sv[k];
             }
             else if (type == 6)
@@ -991,7 +1442,7 @@ void occlude3d::DrawSubmittedGeometry(IDirect3DDevice8* dev)
                 {
                     for (uint32_t gi = 0; gi < gc; ++gi)
                     {
-                        if (batchN + 6 > kBatchMax) { flush(); batchTex = fnt->tex; batchFlags = flags; batchStage = 1; }
+                        if (batchN + 6 > kBatchMax) texBegin(fnt->tex, flags, 1, 6);
                         uint32_t cell = (glyphs[gi] >= fnt->firstCp) ? (glyphs[gi] - fnt->firstCp) : 0;
                         if (cell >= cells) cell = (63u >= fnt->firstCp && (63u - fnt->firstCp) < cells) ? (63u - fnt->firstCp) : 0;
                         const float u0 = static_cast<float>(cell % fnt->cols) * du, u1 = u0 + du;
@@ -1005,8 +1456,7 @@ void occlude3d::DrawSubmittedGeometry(IDirect3DDevice8* dev)
                         batch[batchN++] = tl; batch[batchN++] = br; batch[batchN++] = bl;
                     }
                 };
-                if (batchStage != 1 || batchTex != fnt->tex || batchFlags != flags) flush();
-                batchTex = fnt->tex; batchFlags = flags; batchStage = 1;
+                texBegin(fnt->tex, flags, 1, 6);
                 if (flags & 0x100u)
                 {
                     const D3DCOLOR ocol = col & 0xFF000000u;
@@ -1062,8 +1512,6 @@ void occlude3d::DrawSubmittedGeometry(IDirect3DDevice8* dev)
                 if (!Finite3(c) || !Finite(hw) || !Finite(hh) || !Finite(rad)) continue;
                 prep(c, hw, hh, flags);
                 if (rad < 0.0f) rad = 0.0f; const float mr = (hw < hh ? hw : hh); if (rad > mr) rad = mr;
-                flush();
-                colState(flags);
                 const int SEG = 4;
                 const float HALFPI = 1.57079633f, PIc = 3.14159265f;
                 const float ix = hw - rad, iy = hh - rad;
@@ -1080,7 +1528,7 @@ void occlude3d::DrawSubmittedGeometry(IDirect3DDevice8* dev)
                     fan[fv++] = V{ c[0]+rx*bx[i]+ux*by[i], c[1]+ry*bx[i]+uy*by[i], c[2]+rz*bx[i]+uz*by[i], col };
                     fan[fv++] = V{ c[0]+rx*bx[j]+ux*by[j], c[1]+ry*bx[j]+uy*by[j], c[2]+rz*bx[j]+uz*by[j], col };
                 }
-                dev->DrawPrimitiveUP(D3DPT_TRIANGLELIST, fv / 3, fan, sizeof(V));
+                colAppend(fan, fv, flags);
             }
             else if (type == 10)
             {
@@ -1111,8 +1559,7 @@ void occlude3d::DrawSubmittedGeometry(IDirect3DDevice8* dev)
                 if (texPtr != 0)
                 {
                     if (!texOK(texPtr)) continue;
-                    if (batchStage != 1 || batchTex != texPtr || batchFlags != flags || batchN + 6 > kBatchMax) flush();
-                    batchTex = texPtr; batchFlags = flags; batchStage = 1;
+                    texBegin(texPtr, flags, 1, 6);
                     const VT q[6] = {
                         { cr[0][0],cr[0][1],cr[0][2], col, us[0],vs[0] }, { cr[1][0],cr[1][1],cr[1][2], col, us[1],vs[1] }, { cr[2][0],cr[2][1],cr[2][2], col, us[2],vs[2] },
                         { cr[0][0],cr[0][1],cr[0][2], col, us[0],vs[0] }, { cr[2][0],cr[2][1],cr[2][2], col, us[2],vs[2] }, { cr[3][0],cr[3][1],cr[3][2], col, us[3],vs[3] },
@@ -1121,13 +1568,11 @@ void occlude3d::DrawSubmittedGeometry(IDirect3DDevice8* dev)
                 }
                 else
                 {
-                    flush();
-                    colState(flags);
                     const V q[6] = {
                         { cr[0][0],cr[0][1],cr[0][2], col }, { cr[1][0],cr[1][1],cr[1][2], col }, { cr[2][0],cr[2][1],cr[2][2], col },
                         { cr[0][0],cr[0][1],cr[0][2], col }, { cr[2][0],cr[2][1],cr[2][2], col }, { cr[3][0],cr[3][1],cr[3][2], col },
                     };
-                    dev->DrawPrimitiveUP(D3DPT_TRIANGLELIST, 2, q, sizeof(V));
+                    colAppend(q, 6, flags);
                 }
             }
             else if (type == 12)
@@ -1138,8 +1583,6 @@ void occlude3d::DrawSubmittedGeometry(IDirect3DDevice8* dev)
                 pos += 32;
                 if (!Finite3(c) || !Finite(rad) || !Finite(a0) || !Finite(sweep) || !Finite(inner)) continue;
                 float hw = rad, hh = rad; prep(c, hw, hh, flags); rad = hw;
-                flush();
-                colState(flags);
                 if (inner < 0.0f) inner = 0.0f; if (inner > 0.95f) inner = 0.95f;
                 const float ir = rad * inner;
                 int SEG = static_cast<int>(fabsf(sweep) / 0.13f) + 1; if (SEG < 2) SEG = 2; if (SEG > 96) SEG = 96;
@@ -1154,7 +1597,7 @@ void occlude3d::DrawSubmittedGeometry(IDirect3DDevice8* dev)
                     arcv[vc++]=i0; arcv[vc++]=o0; arcv[vc++]=o1;
                     arcv[vc++]=i0; arcv[vc++]=o1; arcv[vc++]=i1;
                 }
-                if (vc >= 3) dev->DrawPrimitiveUP(D3DPT_TRIANGLELIST, vc / 3, arcv, sizeof(V));
+                colAppend(arcv, vc, flags);
             }
             else if (type == 13)
             {
@@ -1170,8 +1613,7 @@ void occlude3d::DrawSubmittedGeometry(IDirect3DDevice8* dev)
                 if (texPtr != 0)
                 {
                     if (!texOK(texPtr)) continue;
-                    if (batchStage != 1 || batchTex != texPtr || batchFlags != flags || batchN + 6 > kBatchMax) flush();
-                    batchTex = texPtr; batchFlags = flags; batchStage = 1;
+                    texBegin(texPtr, flags, 1, 6);
                     const VT q[6] = {
                         { cr[0][0],cr[0][1],cr[0][2], col,0,0 }, { cr[1][0],cr[1][1],cr[1][2], col,1,0 }, { cr[2][0],cr[2][1],cr[2][2], col,1,1 },
                         { cr[0][0],cr[0][1],cr[0][2], col,0,0 }, { cr[2][0],cr[2][1],cr[2][2], col,1,1 }, { cr[3][0],cr[3][1],cr[3][2], col,0,1 },
@@ -1180,13 +1622,11 @@ void occlude3d::DrawSubmittedGeometry(IDirect3DDevice8* dev)
                 }
                 else
                 {
-                    flush();
-                    colState(flags);
                     const V q[6] = {
                         { cr[0][0],cr[0][1],cr[0][2], col }, { cr[1][0],cr[1][1],cr[1][2], col }, { cr[2][0],cr[2][1],cr[2][2], col },
                         { cr[0][0],cr[0][1],cr[0][2], col }, { cr[2][0],cr[2][1],cr[2][2], col }, { cr[3][0],cr[3][1],cr[3][2], col },
                     };
-                    dev->DrawPrimitiveUP(D3DPT_TRIANGLELIST, 2, q, sizeof(V));
+                    colAppend(q, 6, flags);
                 }
             }
             else if (type == 14)
@@ -1204,12 +1644,11 @@ void occlude3d::DrawSubmittedGeometry(IDirect3DDevice8* dev)
                 const float ys[4] = {  hh,  hh-bwld, -hh+bwld, -hh };
                 const float us[4] = { 0.0f, bf, 1.0f-bf, 1.0f };
                 const float vs[4] = { 0.0f, bf, 1.0f-bf, 1.0f };
-                if (batchStage != 1 || batchTex != texPtr || batchFlags != flags) flush();
-                batchTex = texPtr; batchFlags = flags; batchStage = 1;
+                texBegin(texPtr, flags, 1, 6);
                 #define O3D_NSV(xx,yy,uu,vv) VT{ c[0]+rx*(xx)+ux*(yy), c[1]+ry*(xx)+uy*(yy), c[2]+rz*(xx)+uz*(yy), col, (uu),(vv) }
                 for (int gy = 0; gy < 3; ++gy) for (int gx = 0; gx < 3; ++gx)
                 {
-                    if (batchN + 6 > kBatchMax) { flush(); batchTex = texPtr; batchFlags = flags; batchStage = 1; }
+                    if (batchN + 6 > kBatchMax) texBegin(texPtr, flags, 1, 6);
                     const VT tl = O3D_NSV(xs[gx],ys[gy],us[gx],vs[gy]),   tr = O3D_NSV(xs[gx+1],ys[gy],us[gx+1],vs[gy]);
                     const VT br = O3D_NSV(xs[gx+1],ys[gy+1],us[gx+1],vs[gy+1]), bl = O3D_NSV(xs[gx],ys[gy+1],us[gx],vs[gy+1]);
                     batch[batchN++]=tl; batch[batchN++]=tr; batch[batchN++]=br;
@@ -1244,7 +1683,8 @@ void occlude3d::DrawSubmittedGeometry(IDirect3DDevice8* dev)
 void occlude3d::ResetStatAccumulators(void)
 {
     this->m_StatFrames = 0; this->m_HookMs = 0.0; this->m_EventMs = 0.0;
-    this->m_ItemsAcc = 0.0; this->m_OwnersAcc = 0.0; this->m_BytesAcc = 0.0; this->m_StateAcc = 0.0;
+    this->m_ItemsAcc = 0.0; this->m_OwnersAcc = 0.0; this->m_BytesAcc = 0.0; this->m_StateAcc = 0.0; this->m_DrawsAcc = 0.0;
+    this->m_StatWorstMs = 0.0;
 }
 
 void occlude3d::RenderHookDraw(void)
@@ -1330,10 +1770,13 @@ void occlude3d::RenderHookDrawInner(IDirect3DDevice8* dev)
     if (_st && this->m_QpcFreq > 0)
     {
         LARGE_INTEGER _de; QueryPerformanceCounter(&_de);
-        this->m_HookMs    += static_cast<double>(_de.QuadPart - _ds.QuadPart) * 1000.0 / static_cast<double>(this->m_QpcFreq);
+        const double frameMs = static_cast<double>(_de.QuadPart - _ds.QuadPart) * 1000.0 / static_cast<double>(this->m_QpcFreq);
+        this->m_HookMs    += frameMs;
+        if (frameMs > this->m_StatWorstMs) this->m_StatWorstMs = frameMs;
         this->m_ItemsAcc  += this->m_FrameItems;
         this->m_OwnersAcc += this->m_FrameOwners;
         this->m_StateAcc  += this->m_FrameState;
+        this->m_DrawsAcc  += this->m_FrameDraws;
         this->m_StatFrames++;
     }
 
@@ -1366,19 +1809,16 @@ void occlude3d::RenderHookDrawInner(IDirect3DDevice8* dev)
     if (oldTex != nullptr) oldTex->Release();
 
     // Diagnostics report
-    if (this->StatsOn() && this->m_StatFrames >= 60)
+    if (this->StatsOn() && this->m_StatFrames >= 60 && this->m_Shot == 0)   // the panel's numbers never reset a one-shot's frames
     {
         const double n = static_cast<double>(this->m_StatFrames);
         this->m_DispItems  = this->m_ItemsAcc / n; this->m_DispOwners = this->m_OwnersAcc / n;
         this->m_DispState  = this->m_StateAcc / n; this->m_DispDrawMs = this->m_HookMs / n;
+        this->m_DispDraws  = this->m_DrawsAcc / n;
         this->m_DispRecvMs = this->m_EventMs / n;  this->m_DispBytes  = this->m_BytesAcc / n;
         this->m_HistDrawMs[this->m_HistPos] = static_cast<float>(this->m_DispDrawMs);
         this->m_HistItems[this->m_HistPos]  = static_cast<float>(this->m_DispItems);
         this->m_HistPos = (this->m_HistPos + 1) % kHist;
-        if (this->m_Stats && this->m_LogManager != nullptr)
-            this->m_LogManager->Logf(static_cast<uint32_t>(Ashita::LogLevel::Info), "occlude3d",
-                "STATS avg/frame over %u: items=%.0f owners=%.1f stateCalls=%.0f | drawCPU=%.3f ms  recvCPU=%.3f ms  recvBytes=%.0f",
-                this->m_StatFrames, this->m_DispItems, this->m_DispOwners, this->m_DispState, this->m_DispDrawMs, this->m_DispRecvMs, this->m_DispBytes);
         this->ResetStatAccumulators();
     }
 }
@@ -1389,9 +1829,38 @@ void occlude3d::Direct3DPresent(const RECT*, const RECT*, HWND, const RGNDATA*)
     {
         this->m_Announced = true;
         this->WriteChat("\x1E\x02" "/o3d" "\x1E\x6A" " opens the status panel, "
-                        "\x1E\x02" "/o3d hook" "\x1E\x6A" " toggles the occlusion hook.");
+                        "\x1E\x02" "/o3d hook" "\x1E\x6A" " toggles the occlusion hook.", 0x6A, false);
     }
-
+    if (!this->m_FrameDead)
+    {
+        try
+        {
+            const ULONGLONG now = GetTickCount64();
+            if (this->m_Shot != 0 && (this->m_StatFrames >= 60 || now - this->m_ShotStart > 3000)) this->FinishShot();
+            if (now >= this->m_NextCharCheck)
+            {
+                this->m_NextCharCheck = now + 1000;
+                this->FollowCharacter();
+                char line[300];
+                if (g_log.takeWriteWarning())
+                {
+                    _snprintf_s(line, sizeof line, _TRUNCATE, "can't write its log (%s).", this->LogShown().c_str());
+                    this->WriteChat(line, 0x68);
+                }
+                if (g_log.takeTrimWarning())
+                {
+                    _snprintf_s(line, sizeof line, _TRUNCATE, "its log is over 1.5 MB and cannot be trimmed (%s): is another program holding it open?", this->LogShown().c_str());
+                    this->WriteChat(line, 0x68);
+                }
+            }
+        }
+        catch (...)
+        {
+            this->m_FrameDead = true;
+            g_log.write("error", "Direct3DPresent: an unexpected error; the once-a-second work stops for this session");
+            this->WriteChat("an unexpected error stopped its once-a-second check.", 0x44);
+        }
+    }
     if (this->m_UiOpen)
         this->RenderUI();
 }
@@ -1491,7 +1960,7 @@ void occlude3d::RenderUI(void)
     g->Text("frame budget"); g->SameLine();
     g->TextColored(bc, "%.1f%% of a 60 fps frame", budget * 100.0f);
     g->SetItemTooltip("%s", "Draw CPU as a share of one 60 fps frame.");
-    g->TextDisabled("recv %.3f ms   state %.0f   bytes %.0f", this->m_DispRecvMs, this->m_DispState, this->m_DispBytes);
+    g->TextDisabled("recv %.3f ms   state %.0f   draws %.0f   bytes %.0f", this->m_DispRecvMs, this->m_DispState, this->m_DispDraws, this->m_DispBytes);
 
     const bool ownersOpen = g->CollapsingHeader("Active owners", ImGuiTreeNodeFlags_DefaultOpen);
     g->SetItemTooltip("%s", "owner - source id\nitems - primitive count\nbytes - buffer used\nttl ms - time left before it expires");
@@ -1558,9 +2027,8 @@ void occlude3d::RenderUI(void)
     }
     g->SetItemTooltip("%s", "Toggle the occlusion hook.");
     g->SameLine();
-    _snprintf_s(lbl, sizeof(lbl), _TRUNCATE, "Stats %s##ls", this->m_Stats ? "ON" : "OFF");
-    if (toggleBtn(lbl, this->m_Stats, bw)) this->m_Stats = !this->m_Stats;
-    g->SetItemTooltip("%s", "Log perf numbers to the Ashita log.");
+    if (toggleBtn("Log stats##ls", this->m_Shot != 0, bw)) this->StartShot(1);
+    g->SetItemTooltip("%s", "Measure the next 60 frames and write one line to the log and chat.");
 
     g->End();
 }
@@ -1577,6 +2045,8 @@ extern "C"
 
     __declspec(noinline) void __stdcall expDestroyPlugin(void* instance)
     {
+        if (instance != nullptr && g_keepInstance && instance == g_instance)
+            return;   // a hook call never drained (RemoveHook): the object is leaked rather than pulled from under it
         if (instance != nullptr)
             delete static_cast<occlude3d*>(instance);
     }

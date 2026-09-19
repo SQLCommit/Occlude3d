@@ -6,6 +6,7 @@
   "docsFolder": "occlude3d",
   "docs": [
     "README.md",
+    "CHANGELOG.md",
     "API.md",
     "LICENSE",
     "GPL-3.0.txt",

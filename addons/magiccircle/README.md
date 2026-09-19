@@ -1,7 +1,7 @@
 # Magic Circle v1.0.0
 
-An example addon for the [occlude3d](../../) plugin - two effects that render **occluded behind
-terrain** (walk behind a hill and they're correctly hidden).
+An example addon for the [occlude3d](https://github.com/SQLCommit/Occlude3d) plugin - two effects that render
+**occluded behind terrain** (walk behind a hill and they're correctly hidden).
 
 ## Effects
 
@@ -10,15 +10,17 @@ terrain** (walk behind a hill and they're correctly hidden).
 
 ## Requirements
 
-- Ashita v4, with the **occlude3d** plugin loaded (`/load occlude3d`).
+- Ashita v4, with the **occlude3d** plugin loaded (`/load occlude3d`). Without it, Magic Circle stays idle and says so
+  once in chat.
 
 ## Install
 
-Copy the `magiccircle` folder into your Ashita `addons/` folder, then in-game: `/addon load magiccircle`
+It comes with the occlude3d release zip: extracting that into your Ashita folder adds `addons\magiccircle\`. Then
+in-game: `/addon load magiccircle`
 
 ## Commands
 
-- `/mc` - open the settings panel (colors, sizes, toggles)
+- `/mc` (or `/magiccircle`) - show or hide the settings panel (colors, sizes, toggles)
 - `/mc boom` - fire one explosion
 
 ## License
