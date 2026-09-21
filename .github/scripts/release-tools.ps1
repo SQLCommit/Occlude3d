@@ -2,6 +2,7 @@
 # parts are .github/release.json and .github/scripts/build.ps1. Works in Windows PowerShell 5.1 and PowerShell 7.
 Set-StrictMode -Version 3
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'readme-tools.ps1')
 
 function Get-ReleaseConfig {
     param([string]$Root = '.')
@@ -113,19 +114,38 @@ function New-ReleasePackage {
     $zipName = "$($Cfg.name)-v${Version}_Interface-$Interface.zip"
     $zipPath = Join-Path $outPath $zipName
     $entries = New-Object System.Collections.Generic.List[object]
+    $readmes = @{}
     $entries.Add(@($Dll, "plugins/$($Cfg.dll)"))
     foreach ($doc in $Cfg.docs) {
         $src = Join-Path $rootPath $doc
         if (-not (Test-Path -LiteralPath $src -PathType Leaf)) { throw "$doc (listed in .github/release.json) is not in the repository." }
+        if ((Split-Path $doc -Leaf) -ieq 'README.md') {
+            $readmes[$src] = ConvertTo-ReleaseReadme ([IO.File]::ReadAllText($src))
+        }
         $entries.Add(@($src, "docs/$($Cfg.docsFolder)/$(Split-Path $doc -Leaf)"))
     }
     $extras = if ($Cfg.PSObject.Properties.Name -contains 'extras') { @($Cfg.extras) } else { @() }
     foreach ($extra in $extras) {
-        $dir = Join-Path $rootPath $extra
-        if (-not (Test-Path -LiteralPath $dir -PathType Container)) { throw "$extra (listed in extras) is not in the repository." }
-        foreach ($file in Get-ChildItem -LiteralPath $dir -Recurse -File) {
+        if ($extra -match '(^[/\\]|:|[?*]|(^|[/\\])\.\.?([/\\]|$))') { throw "Invalid extra path: $extra" }
+        $path = Join-Path $rootPath $extra
+        if (-not (Test-Path -LiteralPath $path)) { throw "$extra (listed in extras) is not in the repository." }
+        # Older releases listed whole example folders; new manifests list individual files.
+        $files = if (Test-Path -LiteralPath $path -PathType Container) {
+            @(Get-ChildItem -LiteralPath $path -Recurse -File)
+        } else { @(Get-Item -LiteralPath $path) }
+        foreach ($file in $files) {
             $rel = $file.FullName.Substring($rootPath.Length).TrimStart('\', '/').Replace('\', '/')
-            if (($rel -split '/') | Where-Object { $_.StartsWith('.') }) { continue }   # .gitignore and the like
+            if (($rel -split '/') | Where-Object { $_.StartsWith('.') }) { continue }
+            $part = $rootPath
+            foreach ($segment in ($rel -split '/')) {
+                $part = Join-Path $part $segment
+                if ((Get-Item -LiteralPath $part -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) {
+                    throw "Release extras cannot use symbolic links or junctions: $rel"
+                }
+            }
+            if ($file.Name -ieq 'README.md') {
+                $readmes[$file.FullName] = ConvertTo-ReleaseReadme ([IO.File]::ReadAllText($file.FullName))
+            }
             $entries.Add(@($file.FullName, $rel))
         }
     }
@@ -137,7 +157,13 @@ function New-ReleasePackage {
     $zip = [IO.Compression.ZipFile]::Open($zipPath, [IO.Compression.ZipArchiveMode]::Create)
     try {
         foreach ($e in $entries) {
-            [void][IO.Compression.ZipFileExtensions]::CreateEntryFromFile($zip, $e[0], $e[1], [IO.Compression.CompressionLevel]::Optimal)
+            if ($readmes.ContainsKey($e[0])) {
+                $entry = $zip.CreateEntry($e[1], [IO.Compression.CompressionLevel]::Optimal)
+                $writer = New-Object IO.StreamWriter($entry.Open(), (New-Object Text.UTF8Encoding($false)))
+                try { $writer.Write($readmes[$e[0]]) } finally { $writer.Dispose() }
+            } else {
+                [void][IO.Compression.ZipFileExtensions]::CreateEntryFromFile($zip, $e[0], $e[1], [IO.Compression.CompressionLevel]::Optimal)
+            }
         }
     } finally { $zip.Dispose() }
     Remove-Item -LiteralPath $info

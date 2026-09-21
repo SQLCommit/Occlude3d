@@ -1,6 +1,4 @@
-/**
- * occlude3d - unload safety and the plugin's own log.
- */
+// Module lifetime and thread-freeze helpers.
 #ifndef OCCLUDE3D_UNLOAD_HPP_INCLUDED
 #define OCCLUDE3D_UNLOAD_HPP_INCLUDED
 
@@ -42,8 +40,7 @@ namespace occ
         return true;
     }
 
-    // Keeps this DLL mapped until the process ends. True on success. Called before the first byte goes into the
-    // client, so no thread can ever reach unmapped code through a hook, a trampoline or a return address.
+    // Pin before the first client patch so hooks and return addresses always reach mapped code.
     inline bool pinSelf(const void* anyAddressInside)
     {
         HMODULE self = nullptr;
@@ -80,7 +77,7 @@ namespace occ
                     const DWORD id = GetThreadId(next);
                     if (id == self || holds(id)) { current = next; continue; }
                     if (count_ == kMaxThreads) { current = next; complete_ = false; failStep_ = "too many threads"; break; }
-                    // An exited thread whose object another handle keeps alive is still walked, and SuspendThread refuses it. It runs nothing: skip it.
+                    // An exited thread may still have a handle; skip it when SuspendThread refuses.
                     { DWORD code = 0; if (GetExitCodeThread(next, &code) && code != STILL_ACTIVE) { current = next; continue; } }
                     if (SuspendThread(next) == DWORD(-1)) { DWORD code = 0; if (GetExitCodeThread(next, &code) && code != STILL_ACTIVE) { current = next; continue; } current = next; complete_ = false; failStep_ = "SuspendThread"; failTid_ = id; failErr_ = GetLastError(); break; }
                     Thread& t = threads_[count_++];
@@ -122,7 +119,6 @@ namespace occ
             return false;
         }
         bool complete() const { return complete_; }
-        // Why the last check said "busy": for the log. No allocation.
         void describe(char* out, size_t size, const CodeRange* ranges, size_t n, const DWORD* skip = nullptr, size_t skipCount = 0) const
         {
             int len = _snprintf_s(out, size, _TRUNCATE, "freeze %s (%s tid %lu err %lu), %u threads, %u without a readable context; in range:",
@@ -160,8 +156,8 @@ namespace occ
         size_t unknown_ = 0;
     };
 
-    // Runs `act` with every other thread suspended, at a moment when none of them (except `skip`) is in `ranges`:
-    // tries up to `attempts` times, 1 ms apart. `act` must not allocate or take a lock another thread may hold.
+    // Try up to attempts quiet freezes, 1 ms apart. act must not allocate
+    // or take a lock that a suspended thread could hold.
     template <class Act>
     inline bool whenNoThreadIn(const CodeRange* ranges, size_t n, const DWORD* skip, size_t skipCount, int attempts, Act&& act, char* why = nullptr, size_t whySize = 0)
     {

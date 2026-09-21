@@ -8,12 +8,19 @@
     "README.md",
     "CHANGELOG.md",
     "API.md",
+    "BUILD.md",
     "LICENSE",
     "GPL-3.0.txt",
     "THIRD_PARTY_NOTICES.md"
   ],
   "extras": [
-    "addons/magiccircle"
+    "addons/magiccircle/magiccircle.lua",
+    "addons/magiccircle/README.md",
+    "addons/magiccircle/LICENSE",
+    "addons/magiccircle/assets/circle.png",
+    "addons/magiccircle/assets/spark.png",
+    "addons/magiccircle/assets/smoke_soft.png",
+    "addons/magiccircle/assets/font.png"
   ],
   "versionFile": "src/occlude3d.cpp",
   "versionPattern": "#define\\s+OCCLUDE3D_VERSION\\s+([0-9]+\\.[0-9]+)",

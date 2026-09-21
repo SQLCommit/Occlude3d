@@ -17,3 +17,20 @@ dist/
 *.swp
 .DS_Store
 Thumbs.db
+
+# Local release preparation and development files
+/DISCORD_POST.md
+/DEV_TRACKING.md
+/tools/
+/tests/
+*.bak
+*.tmp
+*.log
+*.orig
+*.rej
+.env
+.env.*
+/Screenshot*
+/*.png
+/*.jpg
+/*.jpeg

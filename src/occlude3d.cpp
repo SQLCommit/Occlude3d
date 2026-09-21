@@ -1,10 +1,4 @@
-/**
- * occlude3d - Shared depth-correct world-space geometry renderer for Ashita addons.
- *
- * Addons submit world geometry via RaiseEvent('occlude3d', byteTable); the plugin trampoline-hooks
- * CXiActorNameDraw::OnMove (where the world depth buffer is bound) and draws the submitted geometry
- * there, so it occludes correctly.
- */
+// Render submitted world geometry in CXiActorNameDraw::OnMove while world depth is bound.
 #include "occlude3d.hpp"
 #include "unload.hpp"
 
@@ -20,18 +14,13 @@
 
 #define OCCLUDE3D_SENTINEL "occlude3d"
 
-////////////////////////////////////////////////////////////////////////////////////////////////////
-// Trampoline hook for CXiActorNameDraw::OnMove.
-//
-// The function prologue is a single 5-byte instruction (A1 imm32 = mov eax,[imm32]), so we overwrite
-// exactly those 5 bytes with a JMP to our detour. The detour saves all registers, calls a worker,
-// restores, then JMPs to a trampoline (original 5 bytes + JMP back to addr+5) so OnMove runs intact.
-////////////////////////////////////////////////////////////////////////////////////////////////////
+// Replace the five-byte mov eax,[imm32] prologue with a jump. The detour preserves registers,
+// renders, then replays the stolen instruction through a trampoline to entry+5.
 namespace
 {
     volatile uint32_t g_hookCalls   = 0;
-    volatile long     g_inFlight    = 0;         // hook calls inside RenderHookDraw right now (they call into Direct3D, outside this DLL)
-    void*             g_trampoline  = nullptr;   // once published, never freed: a thread may still be in it (process lifetime)
+    volatile long     g_inFlight    = 0;         // Active RenderHookDraw calls, including time inside Direct3D.
+    void*             g_trampoline  = nullptr;   // Retained for process lifetime; callers may still be inside.
     uintptr_t         g_hookAddr    = 0;
     uint8_t           g_origBytes[5] = { 0 };
     bool              g_installed   = false;     // our JMP is (or may still be) at the entry
@@ -39,7 +28,7 @@ namespace
     bool              g_keepInstance = false;    // a hook call never drained: the instance and its resources are leaked, never freed
     bool              g_pinned      = false;     // this DLL stays mapped until the game closes (pinned before the first write)
     occlude3d*        g_instance    = nullptr;
-    plog::FileLog     g_log;                     // logs\occlude3d\<Name>_<id>\occlude3d.log; nothing goes to Ashita's log
+    plog::FileLog     g_log;                     // Per-character plugin log.
     const char*       levelName(uint32_t level)
     {
         return level == static_cast<uint32_t>(Ashita::LogLevel::Error) ? "error" : level == static_cast<uint32_t>(Ashita::LogLevel::Warn) ? "warn" : "info";
@@ -181,8 +170,7 @@ bool occlude3d::Initialize(IAshitaCore* core, ILogManager* logger, const uint32_
     g_log.setSession(session, this->m_Run);
     g_log.write("info", session);
     g_log.start();
-    // A previous load of this (pinned) image could not take its hook out: its stub is still reachable and must keep
-    // its state. A second instance over it is refused; a game restart clears it.
+    // Refuse a new instance while a retained hook still uses the pinned image.
     if (g_retained)
     {
         this->m_Refused = true;
@@ -254,7 +242,7 @@ void occlude3d::Release(void)
     }
 
     g_log.write("info", std::string(g_retained ? "unloaded; the hook stays in (pass-through) until the game closes" : "unloaded") + plog::runSuffix(this->m_Run));
-    // The log writer may be stuck on a stalled share: it gets 2 s, then finishes by itself with the DLL kept mapped.
+    // Give the log writer two seconds to stop; retain the DLL if it is still running.
     if (!g_log.stop() && !g_pinned) g_pinned = occ::pinSelf(reinterpret_cast<const void*>(&hook_OnMove));
 }
 
@@ -364,8 +352,7 @@ uintptr_t occlude3d::ResolveNameDraw(void)
 
     this->HookDetail("HOOK: FFXiMain base=0x%08X SizeOfImage=0x%X", reinterpret_cast<uint32_t>(base), size);
 
-    //   CXiActorNameDraw::OnMove signature (Provided by Atom0s in Discord chat):
-    //   A1 ?? ?? ?? ?? 83 38 60 0F ?? ?? ?? ?? ?? 8B 0D ?? ?? ?? ?? 56 6A
+    // CXiActorNameDraw::OnMove signature, provided by atom0s.
     const uint8_t pat[]  = { 0xA1,0,0,0,0, 0x83,0x38,0x60, 0x0F,0,0,0,0,0, 0x8B,0x0D,0,0,0,0, 0x56,0x6A };
     const char    mask[] = "x????xxxx?????xx????xx";
     const int     plen   = static_cast<int>(sizeof(pat));
@@ -426,8 +413,8 @@ bool occlude3d::InstallHook(uintptr_t addr)
         { this->FlushHookDetail(); return false; }
     }
 
-    // A trampoline from an earlier hook at the same address (same pinned image, clean unload) is reused; one for another
-    // address stays allocated (a thread may still be in it) and a new one is made.
+    // Reuse the trampoline for the same entry. Retain old trampolines if the entry changes;
+    // a thread may still be executing in one.
     uint8_t* tramp = (g_trampoline != nullptr && g_hookAddr == addr) ? static_cast<uint8_t*>(g_trampoline) : nullptr;
     if (tramp == nullptr)
     {
@@ -446,8 +433,7 @@ bool occlude3d::InstallHook(uintptr_t addr)
     *reinterpret_cast<int32_t*>(tramp + 6) = static_cast<int32_t>((addr + 5) - (reinterpret_cast<uintptr_t>(tramp) + 10));
     FlushInstructionCache(GetCurrentProcess(), tramp, 10);
 
-    // From the first byte written into the client this DLL stays mapped until the game closes: no thread can reach
-    // unmapped code through the entry JMP, the stub or the trampoline, whatever happens at unload.
+    // Pin before the first patch so entry jumps, stubs and trampolines always reach mapped code.
     if (!g_pinned) g_pinned = occ::pinSelf(reinterpret_cast<const void*>(&hook_OnMove));
     if (!g_pinned)
     {
@@ -464,8 +450,7 @@ bool occlude3d::InstallHook(uintptr_t addr)
 
     uint8_t jump[5] = { 0xE9 };
     *reinterpret_cast<int32_t*>(jump + 1) = static_cast<int32_t>(reinterpret_cast<uintptr_t>(&hook_OnMove) - (addr + 5));
-    // The 5-byte JMP replaces one 5-byte instruction (mov eax,[imm32]): a partial write would be a mov from a wrong
-    // address, so the write happens with every other thread suspended and none of them at the entry.
+    // Freeze outside the entry before writing: a partial jump would decode as mov from an invalid address.
     const occ::CodeRange entry[1] = { { addr, addr + 5 } };
     bool wrote = false, protectFailed = false;
     char why[600] = "";
@@ -507,11 +492,8 @@ bool occlude3d::InstallHook(uintptr_t addr)
     return true;
 }
 
-// Puts the client's entry back with every other thread suspended, at a moment when none of them is inside this DLL,
-// the entry instruction or the trampoline (a thread part-way through the stub or about to return into the entry would
-// otherwise run a half-restored instruction). Only our own JMP is overwritten: bytes someone else put there are left
-// alone. The trampoline is never freed. Whatever the outcome the DLL is pinned, so the stub stays valid; it does nothing
-// once g_instance is null.
+// Restore only our entry jump under a freeze outside the DLL, entry and trampoline.
+// Retain the trampoline and pinned DLL; the stub passes through when g_instance is null.
 void occlude3d::RemoveHook(void)
 {
     if (!g_installed)
@@ -530,9 +512,8 @@ void occlude3d::RemoveHook(void)
     if (g_trampoline != nullptr) ranges[n++] = occ::CodeRange{ reinterpret_cast<uintptr_t>(g_trampoline), reinterpret_cast<uintptr_t>(g_trampoline) + 10 };
     const DWORD writers[1] = { g_log.threadId() };
 
-    // Up to 3 s of attempts, each with every other thread suspended: none may be in the DLL, at the entry or in the
-    // trampoline, and no hook call may be inside RenderHookDraw (it calls into Direct3D, outside every range, with a
-    // return into this DLL and the instance in hand: g_inFlight counts those).
+    // Retry a quiet freeze for up to three seconds. Also require g_inFlight == 0:
+    // a hook inside Direct3D lies outside the checked spans but still holds the instance.
     bool owned = false, restored = false, quiet = false;
     const ULONGLONG deadline = GetTickCount64() + 3000;
     do
@@ -573,8 +554,7 @@ void occlude3d::RemoveHook(void)
         g_retained = true;
         if (!quiet)
         {
-            // A caller may still hold the instance (stalled inside Direct3D). Nothing it can reach is freed: the instance
-            // object, its textures and fonts are kept for the rest of the session (expDestroyPlugin skips the delete).
+            // Retain the instance, textures and fonts if a hook may still hold them inside Direct3D.
             g_keepInstance = true;
             this->LogLine(static_cast<uint32_t>(Ashita::LogLevel::Error), "occlude3d",
                 "HOOK not removed: no moment without a game thread inside the hook came within 3 s; the entry jump stays in and the instance is kept until the game closes.");
@@ -661,9 +641,7 @@ void occlude3d::HandleEventBody(const char* eventName, const void* eventData, co
     }
 
     SubOwner& o = this->m_Owners[slot];
-    // The owner holds one reference per distinct texture in its buffer. Replacing the buffer references
-    // only the textures that are new and releases only the ones that are gone: most frames resubmit the
-    // same textures, and every reference change costs several ReadProcessMemory validations.
+    // Diff distinct textures between submissions to avoid repeated references and pointer validations.
     static uint32_t oldTex[kMaxBufTextures], newTex[kMaxBufTextures];
     const int nOld = (this->m_Legacy || !o.used) ? 0 : CollectBufferTextures(o.buf, o.size, oldTex, kMaxBufTextures);
     const int nNew = this->m_Legacy ? -1 : CollectBufferTextures(p, eventSize, newTex, kMaxBufTextures);
@@ -820,8 +798,7 @@ static bool DecodeItem(uint32_t type, const uint8_t* b, uint32_t pos, uint32_t e
     return true;
 }
 
-// Distinct texture pointers in a submission buffer, in first-seen order, parsed exactly as
-// RefBufferTextures parses them. Returns -1 when there are more than `cap`.
+// Collect distinct texture pointers in submission order; return -1 if capacity is exceeded.
 int occlude3d::CollectBufferTextures(const uint8_t* b, uint32_t size, uint32_t* out, int cap)
 {
     if (b == nullptr || size < 20)
@@ -943,7 +920,6 @@ void occlude3d::HookDetail(const char* fmt, ...)
     this->m_HookDetail.emplace_back(buf);
 }
 
-// The install failed: the scan detail goes into the log after all.
 void occlude3d::FlushHookDetail(void)
 {
     for (const auto& line : this->m_HookDetail) g_log.write("info", line);
@@ -977,7 +953,6 @@ void occlude3d::StartShot(int kind)
     this->m_ShotStart = GetTickCount64();
 }
 
-// The stats line, or the diag report as one block, from what the frames measured.
 void occlude3d::FinishShot(void)
 {
     const int kind = this->m_Shot;
@@ -1072,14 +1047,9 @@ void occlude3d::DrawSubmittedGeometry(IDirect3DDevice8* dev)
     static V           strip[kMaxRibPts * 2];
     static VT          tstrip[kMaxRibPts * 2];
 
-    // Device state for this hook invocation. RenderHookDrawInner has just set a known state (colored
-    // stage, no texture, XYZ|DIFFUSE, ZWRITE/ALPHATEST off, DESTBLEND INVSRCALPHA, ZFUNC LESSEQUAL), and
-    // nothing else touches the device until we return, so a setter is issued only when its value changes.
-    // Only the 0x01 (additive) and 0x04 (depth write) flag bits reach device state.
-    // Legacy mode (/o3d legacy on) re-issues every setter, draws each colored item on its own, breaks
-    // textured batches on the full flags (not just the 0x05 bits) and unbinds the texture after every
-    // textured batch -- the call pattern before batching -- so the two can be timed against each other
-    // in one session.
+    // Cache device state for this hook call; only additive (0x01) and depth-write (0x04) flags affect it.
+    // Legacy mode reissues setters, draws colored items separately and breaks texture batches on all flags
+    // for comparison with the original call pattern.
     const bool legacy = this->m_Legacy;
     uint32_t curFlags = 0u;
     int      curStage = -1;          // -1 colored, 0 texture colour blended by texture alpha, 1 modulate
@@ -1117,8 +1087,7 @@ void occlude3d::DrawSubmittedGeometry(IDirect3DDevice8* dev)
             dev->SetTextureStageState(0, D3DTSS_ALPHAARG2, D3DTA_DIFFUSE);
             this->m_FrameState += 6;
         } else {
-            // Colored: both colour and alpha come from the vertex, so whatever texture is still bound is
-            // never sampled and does not need unbinding.
+            // Colored vertices ignore the bound texture, so no unbind is needed.
             dev->SetTextureStageState(0, D3DTSS_COLOROP,   D3DTOP_SELECTARG1);
             dev->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_DIFFUSE);
             dev->SetTextureStageState(0, D3DTSS_ALPHAOP,   D3DTOP_SELECTARG1);
@@ -1137,14 +1106,12 @@ void occlude3d::DrawSubmittedGeometry(IDirect3DDevice8* dev)
         dev->SetVertexShader(f);
         curFvf = f; this->m_FrameState += 1;
     };
-    // Colored stage + FVF, set only if not already current (legacy mode also left them in place here).
     auto colorStage = [&]() {
         if (curStage != -1) applyStage(-1);
         if (curFvf != (D3DFVF_XYZ | D3DFVF_DIFFUSE)) applyFvf(D3DFVF_XYZ | D3DFVF_DIFFUSE);
     };
 
-    // Two pending batches, at most one non-empty at a time, so items still reach the device in exactly
-    // the order they were submitted: appending to one batch first flushes the other.
+    // Only one batch may be pending; flush it before switching type to preserve submission order.
     static const int kBatchMax = 8192;
     static VT        batch[kBatchMax];     // textured triangles
     static V         cbatch[kBatchMax];    // colored triangles
@@ -1172,14 +1139,12 @@ void occlude3d::DrawSubmittedGeometry(IDirect3DDevice8* dev)
         cbatchN = 0;
     };
     auto flush = [&]() { flushTex(); flushCol(); };
-    // Open (or continue) a textured batch that has room for `need` more vertices.
     auto texBegin = [&](uint32_t tp, uint32_t fl, int stage, int need) {
         flushCol();
         const uint32_t f = legacy ? fl : (fl & 0x05u);
         if (batchStage != stage || batchTex != tp || batchFlags != f || batchN + need > kBatchMax) flushTex();
         batchTex = tp; batchFlags = f; batchStage = stage;
     };
-    // Append colored triangles (n vertices) to the colored batch.
     auto colAppend = [&](const V* v, int n, uint32_t fl) {
         if (n < 3) return;
         flushTex();
@@ -1197,7 +1162,6 @@ void occlude3d::DrawSubmittedGeometry(IDirect3DDevice8* dev)
         cbatchN += n;
         if (legacy) flushCol();
     };
-    // Prepare for an immediately-drawn colored primitive (lines, markers, ribbons).
     auto immediate = [&](uint32_t fl) {
         flush();
         applyFlags(fl); colorStage();
@@ -1808,7 +1772,6 @@ void occlude3d::RenderHookDrawInner(IDirect3DDevice8* dev)
     if (oldIb != nullptr)  oldIb->Release();
     if (oldTex != nullptr) oldTex->Release();
 
-    // Diagnostics report
     if (this->StatsOn() && this->m_StatFrames >= 60 && this->m_Shot == 0)   // the panel's numbers never reset a one-shot's frames
     {
         const double n = static_cast<double>(this->m_StatFrames);
@@ -1865,7 +1828,6 @@ void occlude3d::Direct3DPresent(const RECT*, const RECT*, HWND, const RGNDATA*)
         this->RenderUI();
 }
 
-// /o3d dashboard
 void occlude3d::RenderUI(void)
 {
     IGuiManager* g = (this->m_AshitaCore != nullptr) ? this->m_AshitaCore->GetGuiManager() : nullptr;

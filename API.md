@@ -1,4 +1,6 @@
-# occlude3d - API Reference
+# API reference
+
+[Back to Occlude3d](README.md)
 
 > **Wire format:** `O3D2` (v1) submission + `O3DF` (v1) font registry. **This doc matches occlude3d v1.1** (the wire format is unchanged since v1.0).
 > Everything is **little-endian** and **packed (no padding)**. occlude3d's format is first-party (not
@@ -132,7 +134,7 @@ Encoded in the high 24 bits of `typeWord`. `flags = 0` is the default occluded d
 ## 6. Primitive reference
 
 `baseType` (low byte of `typeWord`) selects the body that follows it. **Item bytes** = 4 (type word) +
-body - use it for the 16 KB budget (section 10). "Billboarded" = the plugin faces it to the camera from
+body - use it for the 16 KB budget (section 11). "Billboarded" = the plugin faces it to the camera from
 the live view matrix (camera-independent: a still anchor doesn't shift as the camera rotates).
 
 | baseType | Item bytes | What |
@@ -225,7 +227,7 @@ struct o3df_register {     // 28 bytes
 ## 9. Lifetime & ownership
 
 - **Owner slots: 32 total, shared across all addons.** Pick a stable, unique `owner` FourCC per logical
-  layer. A new owner beyond 32 is dropped (section 10).
+  layer. A new owner beyond 32 is dropped (section 11).
 - A submission **replaces** that owner's prior geometry. To **update**, re-submit. To **clear**, submit a
   0-item buffer (or let the TTL expire).
 - **PARTICLE is the exception:** submit **once** with a long ttl and do not re-submit - the plugin
@@ -285,12 +287,9 @@ offset  bytes  field
 | RIBBON/TEXRIBBON points | `>= 2`, bounded by buffer size |
 | TRIS/TEXTRIS vertex count | multiple of 3, bounded by buffer size |
 
-Over-limit and malformed submissions are **counted and surfaced**
+Over-limit and malformed submissions are **counted and reported**. Use `/o3d` or `/o3d diag` to inspect them.
 
-**Performance:** same-(texture, flags) textured geometry is **batched** into single draws (thousands of
-same-texture sprites cost ~1 draw + a handful of state calls); texture refs are de-duplicated per
-buffer; the plugin does **zero per-frame heap allocations**. Colored/untextured items are currently not
-batched (each is its own draw) - fine for typical use, a consideration only for very HUD-heavy addons.
+**Performance:** compatible adjacent geometry is batched while preserving submission order, including colored triangles in v1.1. Texture references are de-duplicated and device states are only set when needed. Batches still split when rendering state or capacity requires it; do not assume that every group using one texture becomes one draw call. `/o3d legacy on` restores the older call pattern for comparison, and `/o3d stats` measures the next 60 frames.
 
 ## 12. License
 

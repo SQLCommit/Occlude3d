@@ -1,14 +1,5 @@
-/**
- * occlude3d - Shared depth-correct world-space geometry renderer for Ashita addons.
- *
- * Any addon can submit world-space geometry via RaiseEvent('occlude3d', byteTable) and have it drawn
- * OCCLUDED behind terrain/walls. Occlusion is achieved by trampoline-hooking the engine's
- * CXiActorNameDraw::OnMove (where the world depth buffer is bound, just before nameplates render) and
- * drawing there.
- *
- * The submission wire format (O3D2 header + the 16 item types) and the font registry (O3DF) are
- * specified in API.md - that is the canonical reference.
- */
+// Shared world-space renderer for Ashita addons. Draw in CXiActorNameDraw::OnMove
+// to use world depth for occlusion. Submissions use O3D2; font registration uses O3DF.
 #ifndef OCCLUDE3D_HPP_INCLUDED
 #define OCCLUDE3D_HPP_INCLUDED
 
@@ -62,10 +53,10 @@ class occlude3d final : public IPlugin
     uint32_t m_LastDropOwner;
     void WarnDrop(int cat, const char* reason, uint32_t owner);
     void WriteChat(const char* body, uint8_t bodyColor = 0x6A, bool log = true);   // mirrored to the log unless `log` is false; a failure (0x44) names the log
-    void LogLine(uint32_t level, const char* tag, const char* text);   // the plugin's own log (unload.hpp); the tag is ignored
+    void LogLine(uint32_t level, const char* tag, const char* text);   // Writes to the per-character log; tag is unused.
     void LogF(uint32_t level, const char* tag, const char* fmt, ...);
     bool m_Refused = false;   // this instance was refused at load (a retained hook from an earlier load): Release does nothing
-    // The log (plugin_log.h) and the measured one-shots.
+    // Per-character log and diagnostic counters.
     std::string m_Root;
     plog::Run   m_Run;
     std::string m_CharKey;
