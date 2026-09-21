@@ -22,7 +22,7 @@ Occlude3d is a shared rendering plugin for Ashita addons. It draws markers, line
 
 ## ![Install](https://readme-typing-svg.demolab.com/?font=Cinzel&size=25&duration=1&pause=0&color=638EBD&center=false&vCenter=true&repeat=false&width=600&height=42&lines=Install&letterSpacing=0.5px&weight=700)
 
-Developed with **Ashita v4.3.1.2**, plugin interface **4.30**.
+Developed with **Ashita v4.3.2.1**, plugin interface **4.30**.
 
 1. [Download latest release of Occlude3d](https://github.com/SQLCommit/Occlude3d/releases/latest). Choose the plugin ZIP whose `Interface-N.NN` matches your Ashita plugin interface.
 2. Extract into `/ashita/`. The plugin should be at `/ashita/plugins/occlude3d.dll`.
@@ -75,7 +75,7 @@ See the [changelog](CHANGELOG.md) for new features, improvements, and fixes in e
 ## ![Thanks and credits](https://readme-typing-svg.demolab.com/?font=Cinzel&size=25&duration=1&pause=0&color=638EBD&center=false&vCenter=true&repeat=false&width=600&height=42&lines=Thanks+and+credits&letterSpacing=0.5px&weight=700)
 
 - **atom0s** — The render-hook signature and the suggestion to draw while the world's depth buffer is available.
-- **atom0s, Thorny, and the [Ashita community](https://discord.gg/Ashita)** — For [Ashita](https://www.ashitaxi.com/) and its plugin framework.
+- **The Ashita team** — atom0s, Thorny, and the [Ashita community](https://discord.gg/Ashita).
 
 ## ![License](https://readme-typing-svg.demolab.com/?font=Cinzel&size=25&duration=1&pause=0&color=638EBD&center=false&vCenter=true&repeat=false&width=600&height=42&lines=License&letterSpacing=0.5px&weight=700)
 
